@@ -26,6 +26,13 @@ class ContextWindowState:
     phase: str = "idle"
 
 
+@dataclass(slots=True)
+class ActivityEntry:
+    text: str
+    key: str | None = None
+    transient: bool = False
+
+
 class AgentConversationSession:
     def __init__(self, bot: AgentCordBot, user: discord.abc.User, task: TaskRecord) -> None:
         self.bot = bot
@@ -41,7 +48,7 @@ class AgentConversationSession:
         )
         self.message: discord.Message | None = None
         self.view = AgentConversationView(self)
-        self._activity_lines: deque[str] = deque()
+        self._activity_lines: deque[ActivityEntry] = deque()
         self._prompt_queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker_task: asyncio.Task[None] | None = None
         self._current_run_task: asyncio.Task[object] | None = None
@@ -86,8 +93,6 @@ class AgentConversationSession:
         )
         if self._current_run_task is not None and not self._current_run_task.done():
             self._append_activity("已將新的使用者訊息加入佇列。")
-        else:
-            self._append_activity("已收到新的使用者訊息，準備開始處理。")
         await self.request_render()
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker_loop())
@@ -116,7 +121,11 @@ class AgentConversationSession:
     async def handle_progress(self, event: dict[str, object]) -> None:
         event_type = str(event.get("type", ""))
         if event_type == "activity":
-            self._append_activity(str(event.get("message", "")))
+            self._append_activity(
+                str(event.get("message", "")),
+                key=str(event["activity_key"]) if isinstance(event.get("activity_key"), str) else None,
+                transient=bool(event.get("transient", False)),
+            )
         elif event_type == "tasks":
             self.task_items = [
                 AgentTaskItem(
@@ -269,7 +278,7 @@ class AgentConversationSession:
         return self._render_activity_display()
 
     def _render_activity_display(self) -> str:
-        activity_lines = [f"-# {line}" for line in self._activity_lines] or ["-# 等待新的 agent 訊息。"]
+        activity_lines = [f"-# {entry.text}" for entry in self._activity_lines] or ["-# 等待新的 agent 訊息。"]
         content = self._compose_activity_display(activity_lines)
         while len(content) > _MESSAGE_LIMIT and len(activity_lines) > 1:
             activity_lines = activity_lines[1:]
@@ -279,11 +288,11 @@ class AgentConversationSession:
         return content
 
     def _compose_activity_display(self, activity_lines: list[str]) -> str:
-        parts = ["AI 在幹什麼", *activity_lines]
+        parts = ["## AI 在幹什麼", *activity_lines]
         return "\n".join(parts)
 
     def _render_tasks_block(self) -> str:
-        header = ["tasks"]
+        header = ["## 待辦事項"]
         if not self.task_items:
             return "\n".join([*header, "(無)"])
         status_map = {
@@ -310,22 +319,17 @@ class AgentConversationSession:
             else f"{self.context_state.estimated_tokens} / ? tokens"
         )
         lines = [
-            "context manager window",
-            f"模型：{self.context_state.model or self.task_record.model or '(未設定)'}",
-            f"上下文：{context_text}",
-            f"壓縮次數：{self.context_state.compression_count}",
-            f"歷史訊息：{self.context_state.history_messages}",
-            f"階段：{self.context_state.phase}",
+            f"-# {self.context_state.model or self.task_record.model or '(未設定)'}",
+            f"-# 上下文：{context_text}",
+            f"-# 壓縮次數：{self.context_state.compression_count}",
+            f"-# 歷史訊息：{self.context_state.history_messages}",
+            f"-# 階段：{self.context_state.phase}",
         ]
         return "\n".join(lines)
 
     def _render_operations_block(self) -> str:
         lines = [
-            "要進行的操作",
-            f"會話 ID：#{self.task_record.id}",
-            f"狀態：{self._status_label()}",
-            f"排隊訊息：{self._prompt_queue.qsize()}",
-            "可用按鈕：中斷 / 傳送訊息 / 重新整理",
+            f"-# #{self.task_record.id} | {self._status_label()} | {self._prompt_queue.qsize()} 則訊息待送出",
         ]
         return "\n".join(lines)
 
@@ -342,14 +346,33 @@ class AgentConversationSession:
             return "執行中"
         return "待命"
 
-    def _append_activity(self, text: str) -> None:
+    def _append_activity(self, text: str, *, key: str | None = None, transient: bool = False) -> None:
         normalized = " ".join(str(text).split())
         if not normalized:
             return
         normalized = self._shorten(normalized, 180)
-        if self._activity_lines and self._activity_lines[-1] == normalized:
+        if key is not None:
+            for entry in self._activity_lines:
+                if entry.key != key:
+                    continue
+                if entry.text == normalized and entry.transient == transient:
+                    return
+                entry.text = normalized
+                entry.transient = transient
+                return
+        elif transient is False:
+            self._clear_transient_activities()
+            if self._activity_lines:
+                last_entry = self._activity_lines[-1]
+                if last_entry.key is None and last_entry.text == normalized:
+                    return
+        self._activity_lines.append(ActivityEntry(text=normalized, key=key, transient=transient))
+
+    def _clear_transient_activities(self) -> None:
+        if not self._activity_lines:
             return
-        self._activity_lines.append(normalized)
+        retained_entries = [entry for entry in self._activity_lines if not entry.transient]
+        self._activity_lines = deque(retained_entries)
 
     def _shorten(self, text: str, limit: int) -> str:
         if len(text) <= limit:
@@ -361,10 +384,10 @@ class AgentConversationView(discord.ui.LayoutView):
     def __init__(self, session: AgentConversationSession) -> None:
         super().__init__(timeout=None)
         self.session = session
-        self._activity_display = discord.ui.TextDisplay("AI 在幹什麼\n-# 等待新的 agent 訊息。")
-        self._tasks_display = discord.ui.TextDisplay("tasks\n(無)")
-        self._context_display = discord.ui.TextDisplay("context manager window\n模型：(未設定)")
-        self._operations_display = discord.ui.TextDisplay("要進行的操作\n會話 ID：#0")
+        self._activity_display = discord.ui.TextDisplay("## AI 在幹什麼\n-# 等待新的 agent 訊息。")
+        self._tasks_display = discord.ui.TextDisplay("## 待辦事項\n(無)")
+        self._context_display = discord.ui.TextDisplay("-# (未設定)")
+        self._operations_display = discord.ui.TextDisplay("-# #0")
         self._interrupt_button = discord.ui.Button(label="中斷", style=discord.ButtonStyle.danger)
         self._interrupt_button.callback = self._on_interrupt
         self._send_message_button = discord.ui.Button(label="傳送訊息", style=discord.ButtonStyle.primary)

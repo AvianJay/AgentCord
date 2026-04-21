@@ -117,7 +117,8 @@ class CodingAgent:
             progress_callback,
             {
                 "type": "activity",
-                "message": f"開始處理任務 #{task.id}。",
+                "activity_key": "task",
+                "message": f"任務 #{task.id} 執行中。",
             },
         )
 
@@ -145,45 +146,44 @@ class CodingAgent:
                 },
             )
             self.credits.ensure_affordable(user_id, config, context)
-            await self._emit_progress(
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": f"第 {iteration} 輪決策生成中。",
-                },
+                f"第 {iteration} 輪決策生成中。",
+                activity_key=f"decision:{iteration}",
             )
             step_response = await provider.stream_generate(
                 [
                     {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
                     {"role": "user", "content": context},
                 ],
-                on_delta=self._build_stream_progress_callback("決策生成", progress_callback),
+                on_delta=self._build_stream_progress_callback(
+                    f"第 {iteration} 輪決策生成中",
+                    progress_callback,
+                    activity_key=f"decision:{iteration}",
+                ),
             )
             self.credits.charge(user_id, step_response.usage.cost)
             decision = parse_json_object(step_response.content)
-            await self._emit_progress(
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": f"第 {iteration} 輪收到決策，準備執行工具。",
-                },
+                f"第 {iteration} 輪決策已完成，準備執行工具。",
+                activity_key=f"decision:{iteration}",
             )
             tool_results, touched_files, current_task_items = await self._execute_actions(
                 user_id,
                 decision.get("actions", []),
                 current_task_items,
                 progress_callback,
+                iteration,
             )
             changed_files.update(touched_files)
 
             validations.extend(self._validate_changed_python_files(user_id, touched_files))
             if validations:
-                await self._emit_progress(
+                await self._emit_activity(
                     progress_callback,
-                    {
-                        "type": "activity",
-                        "message": f"目前累積 {len(validations)} 筆驗證結果。",
-                    },
+                    f"目前累積 {len(validations)} 筆驗證結果。",
+                    activity_key="validation",
                 )
             transcript.append(
                 {
@@ -199,12 +199,10 @@ class CodingAgent:
                 }
             )
             final_summary = str(decision.get("summary", final_summary))
-            await self._emit_progress(
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": f"第 {iteration} 輪摘要：{final_summary}",
-                },
+                f"目前摘要：{final_summary}",
+                activity_key="summary",
             )
             if decision.get("done"):
                 break
@@ -228,6 +226,7 @@ class CodingAgent:
             progress_callback,
             {
                 "type": "activity",
+                "activity_key": "task",
                 "message": f"任務 #{task.id} 已完成。",
             },
         )
@@ -275,29 +274,29 @@ class CodingAgent:
             },
         )
         self.credits.ensure_affordable(user_id, config, planning_prompt)
-        await self._emit_progress(
+        await self._emit_activity(
             progress_callback,
-            {
-                "type": "activity",
-                "message": "開始生成執行計畫。",
-            },
+            "計畫生成中。",
+            activity_key="plan",
         )
         response = await provider.stream_generate(
             [
                 {"role": "system", "content": _PLANNING_SYSTEM_PROMPT},
                 {"role": "user", "content": planning_prompt},
             ],
-            on_delta=self._build_stream_progress_callback("計畫生成", progress_callback),
+            on_delta=self._build_stream_progress_callback(
+                "計畫生成中",
+                progress_callback,
+                activity_key="plan",
+            ),
         )
         self.credits.charge(user_id, response.usage.cost)
         data = parse_json_object(response.content)
         plan = [str(item) for item in data.get("plan", []) if str(item).strip()]
-        await self._emit_progress(
+        await self._emit_activity(
             progress_callback,
-            {
-                "type": "activity",
-                "message": f"計畫生成完成，共 {len(plan or [])} 個步驟。",
-            },
+            f"計畫生成已完成，共 {len(plan or [])} 個步驟。",
+            activity_key="plan",
         )
         return plan or ["檢查需求", "更新檔案", "驗證語法"]
 
@@ -327,17 +326,17 @@ class CodingAgent:
         actions: list[dict[str, Any]],
         current_task_items: list[AgentTaskItem],
         progress_callback: ProgressCallback | None,
+        iteration: int,
     ) -> tuple[list[dict[str, Any]], list[str], list[AgentTaskItem]]:
         results: list[dict[str, Any]] = []
         touched_files: list[str] = []
-        for action in actions[: self.settings.agent_max_actions_per_iteration]:
+        for action_index, action in enumerate(actions[: self.settings.agent_max_actions_per_iteration], start=1):
             tool_name = action.get("tool")
-            await self._emit_progress(
+            activity_key = f"tool:{iteration}:{action_index}"
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": self._format_tool_start_message(tool_name, action),
-                },
+                self._format_tool_start_message(tool_name, action),
+                activity_key=activity_key,
             )
             try:
                 if tool_name == "read_file":
@@ -403,20 +402,16 @@ class CodingAgent:
                     results.append({"tool": tool_name, "error": "不支援的工具。"})
             except (WorkspaceError, KeyError, ValueError, aiohttp.ClientError) as exc:
                 results.append({"tool": tool_name, "error": str(exc)})
-                await self._emit_progress(
+                await self._emit_activity(
                     progress_callback,
-                    {
-                        "type": "activity",
-                        "message": f"工具 {tool_name} 執行失敗：{exc}",
-                    },
+                    f"{self._format_tool_label(tool_name)}失敗：{exc}",
+                    activity_key=activity_key,
                 )
                 continue
-            await self._emit_progress(
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": self._format_tool_finish_message(tool_name, action),
-                },
+                self._format_tool_finish_message(tool_name, action),
+                activity_key=activity_key,
             )
         return results, touched_files, current_task_items
 
@@ -452,12 +447,10 @@ class CodingAgent:
                 f"對話內容：\n{self._render_conversation_history(older_messages)}"
             )
             self.credits.ensure_affordable(user_id, config, summary_prompt)
-            await self._emit_progress(
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": "上下文接近上限，正在自動壓縮舊對話。",
-                },
+                "上下文壓縮中。",
+                activity_key="compression",
             )
             response = await provider.generate(
                 [
@@ -471,14 +464,30 @@ class CodingAgent:
                 *recent_messages,
             ]
             compression_count += 1
-            await self._emit_progress(
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": f"上下文壓縮完成，目前已壓縮 {compression_count} 次。",
-                },
+                f"上下文壓縮已完成，目前已壓縮 {compression_count} 次。",
+                activity_key="compression",
             )
         return history_messages, compression_count
+
+    async def _emit_activity(
+        self,
+        progress_callback: ProgressCallback | None,
+        message: str,
+        *,
+        activity_key: str | None = None,
+        transient: bool = False,
+    ) -> None:
+        await self._emit_progress(
+            progress_callback,
+            {
+                "type": "activity",
+                "message": message,
+                "activity_key": activity_key,
+                "transient": transient,
+            },
+        )
 
     async def _emit_progress(self, progress_callback: ProgressCallback | None, event: dict[str, Any]) -> None:
         if progress_callback is None:
@@ -489,8 +498,10 @@ class CodingAgent:
 
     def _build_stream_progress_callback(
         self,
-        label: str,
+        message_prefix: str,
         progress_callback: ProgressCallback | None,
+        *,
+        activity_key: str,
     ) -> Callable[[str], Awaitable[None] | None] | None:
         if progress_callback is None:
             return None
@@ -504,12 +515,10 @@ class CodingAgent:
             if received_chars < next_emit_threshold:
                 return
             next_emit_threshold += 240
-            await self._emit_progress(
+            await self._emit_activity(
                 progress_callback,
-                {
-                    "type": "activity",
-                    "message": f"{label} 串流中，已接收約 {received_chars} 字元。",
-                },
+                f"{message_prefix}（已接收約 {received_chars} 字元）",
+                activity_key=activity_key,
             )
 
         return on_delta
@@ -542,43 +551,58 @@ class CodingAgent:
             items.append(AgentTaskItem(title=title, status=status))
         return items
 
+    def _format_tool_label(self, tool_name: Any) -> str:
+        labels = {
+            "read_file": "讀取檔案",
+            "write_file": "寫入檔案",
+            "list_files": "列出路徑",
+            "delete_file": "刪除檔案",
+            "create_folder": "建立資料夾",
+            "apply_patch": "套用 patch",
+            "py_compile_check": "語法檢查",
+            "search_web": "搜尋網路",
+            "fetch_url": "抓取網址",
+            "tasks": "更新 tasks 清單",
+        }
+        return labels.get(str(tool_name), f"工具 {tool_name}")
+
     def _format_tool_start_message(self, tool_name: Any, action: dict[str, Any]) -> str:
         if tool_name == "read_file":
-            return f"開始讀取檔案：{action.get('path', '')}"
+            return f"讀取檔案中：{action.get('path', '')}"
         if tool_name == "write_file":
-            return f"開始寫入檔案：{action.get('path', '')}"
+            return f"寫入檔案中：{action.get('path', '')}"
         if tool_name == "list_files":
-            return f"開始列出路徑：{action.get('path', '.') }"
+            return f"列出路徑中：{action.get('path', '.') }"
         if tool_name == "delete_file":
-            return f"開始刪除檔案：{action.get('path', '')}"
+            return f"刪除檔案中：{action.get('path', '')}"
         if tool_name == "create_folder":
-            return f"開始建立資料夾：{action.get('path', '')}"
+            return f"建立資料夾中：{action.get('path', '')}"
         if tool_name == "apply_patch":
-            return "開始套用 patch。"
+            return "套用 patch 中。"
         if tool_name == "py_compile_check":
-            return f"開始語法檢查：{action.get('path', '')}"
+            return f"語法檢查中：{action.get('path', '')}"
         if tool_name == "search_web":
-            return f"開始搜尋網路：{action.get('query', '')}"
+            return f"搜尋網路中：{action.get('query', '')}"
         if tool_name == "fetch_url":
-            return f"開始抓取網址：{action.get('url', '')}"
+            return f"抓取網址中：{action.get('url', '')}"
         if tool_name == "tasks":
-            return "開始更新 tasks 清單。"
-        return f"開始執行工具：{tool_name}"
+            return "更新 tasks 清單中。"
+        return f"執行工具中：{tool_name}"
 
     def _format_tool_finish_message(self, tool_name: Any, action: dict[str, Any]) -> str:
         if tool_name in {"read_file", "write_file", "delete_file", "create_folder", "py_compile_check"}:
-            return f"工具 {tool_name} 已完成：{action.get('path', '')}"
+            return f"{self._format_tool_label(tool_name)}已完成：{action.get('path', '')}"
         if tool_name == "list_files":
-            return f"工具 list_files 已完成：{action.get('path', '.') }"
+            return f"列出路徑已完成：{action.get('path', '.') }"
         if tool_name == "search_web":
-            return "工具 search_web 已完成。"
+            return "搜尋網路已完成。"
         if tool_name == "fetch_url":
-            return "工具 fetch_url 已完成。"
+            return "抓取網址已完成。"
         if tool_name == "apply_patch":
-            return "工具 apply_patch 已完成。"
+            return "套用 patch 已完成。"
         if tool_name == "tasks":
-            return "tools 區塊中的 tasks 已更新。"
-        return f"工具 {tool_name} 已完成。"
+            return "tasks 清單已更新。"
+        return f"執行工具已完成：{tool_name}"
 
     async def _search_web(self, user_id: int, query: str) -> dict[str, Any]:
         config = UserModelConfig(
