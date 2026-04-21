@@ -23,7 +23,7 @@ from agentcord.workspace import WorkspaceError, WorkspaceManager
 COMMAND_NAME_TRANSLATIONS = {
     "ask": "詢問",
     "agent": "代理",
-    "call-ai-codeing": "叫 AI 寫程式",
+    "call-ai-codeing": "叫ai寫程式",
     "agent-history": "代理歷史",
     "agent-open": "開啟代理對話",
     "set-model": "設定模型",
