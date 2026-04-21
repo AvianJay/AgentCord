@@ -21,6 +21,21 @@ from agentcord.workspace import WorkspaceError, WorkspaceManager
 
 
 COMMAND_NAME_TRANSLATIONS = {
+    "ask": "詢問",
+    "agent": "代理",
+    "call-ai-codeing": "叫 AI 寫程式",
+    "agent-history": "代理歷史",
+    "agent-open": "開啟代理對話",
+    "set-model": "設定模型",
+    "custom-model": "自訂模型",
+    "file-manager": "檔案管理",
+    "list": "列表",
+    "read": "讀取",
+    "write": "寫入",
+    "delete": "刪除",
+    "mkdir": "建立資料夾",
+    "export-zip": "匯出壓縮檔",
+    "import-zip": "匯入壓縮檔",
     "prompt": "提示",
     "model": "模型",
     "provider": "供應商",
@@ -294,7 +309,7 @@ def register_commands(bot: AgentCordBot) -> None:
         )
         await session.enqueue_prompt(prompt)
 
-    @bot.tree.command(name="call-ai-codeing", description="/agent 的別名。")
+    @bot.tree.command(name="call-ai-codeing", description="叫 AI 寫程式。")
     @app_commands.describe(prompt="描述要讓代理建立或修改的內容。")
     async def agent_alias(interaction: discord.Interaction, prompt: str) -> None:
         session = await start_new_agent_session(interaction, prompt)
