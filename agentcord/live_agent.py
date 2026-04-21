@@ -394,21 +394,22 @@ class AgentConversationView(discord.ui.LayoutView):
         self._send_message_button.callback = self._on_send_message
         self._refresh_button = discord.ui.Button(label="重新整理", style=discord.ButtonStyle.secondary)
         self._refresh_button.callback = self._on_refresh
-
-        self.add_item(self._activity_display)
-        self.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
-        self.add_item(self._tasks_display)
-        self.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
-        self.add_item(self._context_display)
-        self.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
-        self.add_item(self._operations_display)
-        self.add_item(
+        self._container = discord.ui.Container(accent_colour=discord.Colour.blurple())
+        self._container.add_item(self._activity_display)
+        self._container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
+        self._container.add_item(self._tasks_display)
+        self._container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
+        self._container.add_item(self._context_display)
+        self._container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
+        self._container.add_item(self._operations_display)
+        self._container.add_item(
             discord.ui.ActionRow(
                 self._interrupt_button,
                 self._send_message_button,
                 self._refresh_button,
             )
         )
+        self.add_item(self._container)
 
     async def _on_interrupt(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user.id:
