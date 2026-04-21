@@ -55,6 +55,8 @@ class AgentConversationSession:
         self._render_task: asyncio.Task[None] | None = None
         self._render_lock = asyncio.Lock()
         self._closed = False
+        self._run_sequence = 0
+        self._active_run_scope: str | None = None
         if task.summary:
             self._append_activity(f"目前摘要：{task.summary}")
 
@@ -121,11 +123,20 @@ class AgentConversationSession:
     async def handle_progress(self, event: dict[str, object]) -> None:
         event_type = str(event.get("type", ""))
         if event_type == "activity":
-            self._append_activity(
-                str(event.get("message", "")),
-                key=str(event["activity_key"]) if isinstance(event.get("activity_key"), str) else None,
-                transient=bool(event.get("transient", False)),
-            )
+            raw_key = str(event["activity_key"]) if isinstance(event.get("activity_key"), str) else None
+            scoped_key = self._scope_activity_key(raw_key)
+            message = str(event.get("message", ""))
+            if raw_key is not None and raw_key.startswith("decision:") and "決策已完成" in message:
+                self._remove_activity(scoped_key)
+            else:
+                self._append_activity(
+                    message,
+                    key=scoped_key,
+                    transient=bool(event.get("transient", False)),
+                )
+        elif event_type == "activity_remove":
+            raw_key = str(event["activity_key"]) if isinstance(event.get("activity_key"), str) else None
+            self._remove_activity(self._scope_activity_key(raw_key))
         elif event_type == "tasks":
             self.task_items = [
                 AgentTaskItem(
@@ -191,6 +202,8 @@ class AgentConversationSession:
     async def _worker_loop(self) -> None:
         while not self._prompt_queue.empty() and not self._closed:
             prompt = await self._prompt_queue.get()
+            self._run_sequence += 1
+            self._active_run_scope = f"run:{self._run_sequence}"
             self._append_activity(f"開始處理使用者訊息：{prompt}")
             await self.request_render(force=True)
             try:
@@ -272,6 +285,7 @@ class AgentConversationSession:
                 )
             finally:
                 self._current_run_task = None
+                self._active_run_scope = None
                 await self.request_render(force=True)
 
     def render_content(self) -> str:
@@ -373,6 +387,16 @@ class AgentConversationSession:
             return
         retained_entries = [entry for entry in self._activity_lines if not entry.transient]
         self._activity_lines = deque(retained_entries)
+
+    def _remove_activity(self, key: str | None) -> None:
+        if key is None or not self._activity_lines:
+            return
+        self._activity_lines = deque(entry for entry in self._activity_lines if entry.key != key)
+
+    def _scope_activity_key(self, key: str | None) -> str | None:
+        if key is None or self._active_run_scope is None:
+            return key
+        return f"{self._active_run_scope}:{key}"
 
     def _shorten(self, text: str, limit: int) -> str:
         if len(text) <= limit:

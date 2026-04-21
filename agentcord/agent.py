@@ -164,11 +164,7 @@ class CodingAgent:
             )
             self.credits.charge(user_id, step_response.usage.cost)
             decision = parse_json_object(step_response.content)
-            await self._emit_activity(
-                progress_callback,
-                f"第 {iteration} 輪決策已完成，準備執行工具。",
-                activity_key=f"decision:{iteration}",
-            )
+            await self._remove_activity(progress_callback, activity_key=f"decision:{iteration}")
             tool_results, touched_files, current_task_items = await self._execute_actions(
                 user_id,
                 decision.get("actions", []),
@@ -486,6 +482,20 @@ class CodingAgent:
                 "message": message,
                 "activity_key": activity_key,
                 "transient": transient,
+            },
+        )
+
+    async def _remove_activity(
+        self,
+        progress_callback: ProgressCallback | None,
+        *,
+        activity_key: str,
+    ) -> None:
+        await self._emit_progress(
+            progress_callback,
+            {
+                "type": "activity_remove",
+                "activity_key": activity_key,
             },
         )
 
