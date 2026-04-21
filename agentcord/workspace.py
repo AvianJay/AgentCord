@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import py_compile
+import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -82,6 +83,24 @@ class WorkspaceManager:
     def create_folder(self, user_id: int, path: str) -> str:
         absolute = self._resolve_path(user_id, path)
         absolute.mkdir(parents=True, exist_ok=True)
+        return self._to_relative(user_id, absolute)
+
+    def remove_folder(self, user_id: int, path: str, *, force: bool = False) -> str:
+        absolute = self._resolve_path(user_id, path)
+        root = self.user_root(user_id)
+        if absolute == root:
+            raise WorkspaceError("不允許刪除工作區根目錄。")
+        if not absolute.exists():
+            raise WorkspaceError(f"找不到資料夾：{path}")
+        if absolute.is_file():
+            raise WorkspaceError("rmdir 只支援刪除資料夾。")
+        if force:
+            shutil.rmtree(absolute)
+            return self._to_relative(user_id, absolute)
+        try:
+            absolute.rmdir()
+        except OSError as exc:
+            raise WorkspaceError("資料夾不是空的；若要遞迴刪除請設 force=true。") from exc
         return self._to_relative(user_id, absolute)
 
     def export_zip(self, user_id: int, target: Path) -> Path:

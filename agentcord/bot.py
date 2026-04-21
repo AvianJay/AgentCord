@@ -35,6 +35,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "write": "寫入",
     "delete": "刪除",
     "mkdir": "建立資料夾",
+    "rmdir": "刪除資料夾",
     "export-zip": "匯出壓縮檔",
     "import-zip": "匯入壓縮檔",
     "prompt": "提示",
@@ -42,6 +43,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "provider": "供應商",
     "api_key": "金鑰",
     "archive": "壓縮檔",
+    "force": "強制",
     "path": "路徑",
     "content": "內容",
     "task_id": "任務編號",
@@ -550,6 +552,29 @@ def register_commands(bot: AgentCordBot) -> None:
         )
         await interaction.response.send_message(f"已建立資料夾 {created_path}。", ephemeral=True)
 
+    async def handle_rmdir(interaction: discord.Interaction, path: str, force: bool) -> None:
+        removed_path = bot.workspace.remove_folder(interaction.user.id, path, force=force)
+        await log_interaction(
+            interaction,
+            "刪除工作區資料夾。",
+            fields=[
+                ("路徑", removed_path, True),
+                ("Force", str(force), True),
+            ],
+        )
+        suffix = "（已遞迴刪除內容）" if force else ""
+        await interaction.response.send_message(f"已刪除資料夾 {removed_path}{suffix}。", ephemeral=True)
+
+    @file_manager.command(name="rmdir", description="刪除資料夾。")
+    @app_commands.describe(path="要刪除的工作區資料夾路徑。", force="是否遞迴刪除非空資料夾。")
+    async def file_rmdir(interaction: discord.Interaction, path: str, force: bool = False) -> None:
+        await handle_rmdir(interaction, path, force)
+
+    @bot.tree.command(name="rmdir", description="刪除工作區資料夾。")
+    @app_commands.describe(path="要刪除的工作區資料夾路徑。", force="是否遞迴刪除非空資料夾。")
+    async def rmdir_command(interaction: discord.Interaction, path: str, force: bool = False) -> None:
+        await handle_rmdir(interaction, path, force)
+
     bot.tree.add_command(file_manager)
 
     @bot.tree.command(name="export-zip", description="將工作區匯出為 zip 壓縮檔。")
@@ -634,6 +659,8 @@ def register_commands(bot: AgentCordBot) -> None:
     @file_write.error
     @file_delete.error
     @file_mkdir.error
+    @file_rmdir.error
+    @rmdir_command.error
     @export_zip.error
     @import_zip.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
