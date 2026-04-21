@@ -23,6 +23,7 @@ from agentcord.workspace import WorkspaceError, WorkspaceManager
 COMMAND_NAME_TRANSLATIONS = {
     "ask": "詢問",
     "agent": "代理",
+    "plan": "計畫",
     "call-ai-codeing": "叫ai寫程式",
     "agent-history": "代理歷史",
     "agent-open": "開啟代理對話",
@@ -255,7 +256,7 @@ def register_commands(bot: AgentCordBot) -> None:
         command = interaction.command
         if command is None:
             return False
-        return command.name in {"agent", "call-ai-codeing", "agent-history", "agent-open"}
+        return command.name in {"agent", "plan", "call-ai-codeing", "agent-history", "agent-open"}
 
     @bot.tree.command(name="ask", description="向目前設定的 AI 模型提問。")
     @app_commands.describe(prompt="輸入要交給 AI 助手的提示內容。")
@@ -309,6 +310,41 @@ def register_commands(bot: AgentCordBot) -> None:
             fields=[("Task ID", str(session.task_id), True)],
         )
         await session.enqueue_prompt(prompt)
+
+    @bot.tree.command(name="plan", description="為任務生成執行計畫。")
+    @app_commands.describe(prompt="描述要讓 AI 規劃的程式任務。")
+    async def plan_command(interaction: discord.Interaction, prompt: str) -> None:
+        assert bot.agent is not None
+        await interaction.response.defer(thinking=True)
+        result = await bot.agent.plan(interaction.user.id, prompt)
+        usage = result.usage
+        await log_interaction(
+            interaction,
+            f"建立獨立執行計畫。\nPrompt: {preview_text(prompt)}",
+            fields=[
+                ("模型", result.model or bot.db.get_model_config(interaction.user.id, bot.settings.default_pollinations_model).model, True),
+                ("步驟", str(len(result.plan)), True),
+            ],
+        )
+        lines = ["執行計畫："]
+        for index, step in enumerate(result.plan, start=1):
+            lines.append(f"{index}. {step}")
+        if usage is not None:
+            remaining = bot.db.get_credits(interaction.user.id)
+            lines.extend(
+                [
+                    "",
+                    f"模型：{result.model or '(未設定)'}",
+                    f"已使用額度：{usage.cost:.2f} (輸入={usage.input_tokens}，輸出={usage.output_tokens}，單價={usage.model_rate:.3f})",
+                    f"剩餘額度：{remaining:.2f}",
+                ]
+            )
+        message = "\n".join(lines)
+        for index, chunk in enumerate(chunk_text(message)):
+            if index == 0:
+                await interaction.followup.send(chunk)
+            else:
+                await interaction.followup.send(chunk)
 
     @bot.tree.command(name="call-ai-codeing", description="叫 AI 寫程式。")
     @app_commands.describe(prompt="描述要讓代理建立或修改的內容。")
@@ -587,6 +623,7 @@ def register_commands(bot: AgentCordBot) -> None:
 
     @ask.error
     @agent_command.error
+    @plan_command.error
     @agent_alias.error
     @agent_history.error
     @agent_open.error

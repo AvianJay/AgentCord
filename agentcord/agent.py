@@ -9,7 +9,7 @@ import aiohttp
 from agentcord.ai import PollinationsProvider, create_provider, parse_json_object, resolve_pollinations_model
 from agentcord.config import Settings
 from agentcord.database import Database
-from agentcord.models import AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
+from agentcord.models import AIUsage, AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
 from agentcord.workspace import WorkspaceError, WorkspaceManager
 
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -28,6 +28,14 @@ class AgentRunResult:
     estimated_tokens: int = 0
     compression_count: int = 0
     task_id: int | None = None
+
+
+@dataclass(slots=True)
+class AgentPlanResult:
+    plan: list[str]
+    model: str = ""
+    context_length: int | None = None
+    usage: AIUsage | None = None
 
 
 class CreditManager:
@@ -123,16 +131,7 @@ class CodingAgent:
             },
         )
 
-        plan, actual_model = await self._create_plan(
-            user_id,
-            prompt,
-            provider,
-            config,
-            history_messages,
-            progress_callback,
-            context_length,
-            actual_model,
-        )
+        plan = list(task.plan) if task.plan else []
         transcript: list[dict[str, str]] = []
         changed_files: set[str] = set(task.related_files)
         validations: list[str] = []
@@ -263,6 +262,41 @@ class CodingAgent:
             task_id=task.id,
         )
 
+    async def plan(
+        self,
+        user_id: int,
+        prompt: str,
+        *,
+        task: TaskRecord | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> AgentPlanResult:
+        config = self.db.get_model_config(user_id, self.settings.default_pollinations_model)
+        provider = create_provider(self.session, self.settings, config)
+        model_info = None
+        if config.provider is Provider.POLLINATIONS:
+            model_info = await resolve_pollinations_model(self.session, self.settings, config.model)
+        context_length = model_info.context_length if model_info is not None else None
+        current_model = config.model
+        history_messages = list(task.messages) if task is not None else []
+        if prompt.strip():
+            history_messages.append(ConversationMessage(role="user", content=prompt))
+        plan, resolved_model, usage = await self._create_plan(
+            user_id,
+            prompt,
+            provider,
+            config,
+            history_messages,
+            progress_callback,
+            context_length,
+            current_model,
+        )
+        return AgentPlanResult(
+            plan=plan,
+            model=resolved_model,
+            context_length=context_length,
+            usage=usage,
+        )
+
     async def _create_plan(
         self,
         user_id: int,
@@ -273,7 +307,7 @@ class CodingAgent:
         progress_callback: ProgressCallback | None,
         context_length: int | None,
         current_model: str,
-    ) -> tuple[list[str], str]:
+    ) -> tuple[list[str], str, AIUsage]:
         planning_prompt = (
             "請為下列程式任務建立精簡的執行計畫。"
             "請只回傳 JSON，最上層需包含名為 plan 的鍵，內容是繁體中文短句列表。\n\n"
@@ -331,7 +365,7 @@ class CodingAgent:
             f"計畫生成已完成，共 {len(plan or [])} 個步驟。",
             activity_key="plan",
         )
-        return plan or ["檢查需求", "更新檔案", "驗證語法"], resolved_model
+        return plan or ["檢查需求", "更新檔案", "驗證語法"], resolved_model, response.usage
 
     def _build_iteration_context(
         self,
