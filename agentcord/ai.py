@@ -288,14 +288,30 @@ def create_provider(
 def parse_json_object(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
         if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or start >= end:
-        raise ValueError("模型輸出不包含 JSON 物件。")
-    return json.loads(cleaned[start : end + 1])
+            cleaned = cleaned[4:].lstrip()
+
+    decoder = json.JSONDecoder()
+    search_start = 0
+    while True:
+        start = cleaned.find("{", search_start)
+        if start == -1:
+            break
+        try:
+            parsed, _ = decoder.raw_decode(cleaned, start)
+        except json.JSONDecodeError:
+            search_start = start + 1
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        search_start = start + 1
+    raise ValueError("模型輸出不包含合法 JSON 物件。")
 
 
 async def fetch_pollinations_models(
