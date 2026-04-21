@@ -41,6 +41,13 @@ class SearchAllowlistTests(unittest.TestCase):
         self.assertTrue(sa.is_allowed(1, "https://example.com/a"))
         self.assertFalse(sa.is_allowed(1, "https://example.com/other"))
 
+    def test_extract_urls_strips_trailing_punctuation(self) -> None:
+        sa = SearchAllowlist()
+        result = "Read https://example.com/path, then https://example.org/a.)"
+        urls = sa.extract_urls(result)
+        self.assertIn("https://example.com/path", urls)
+        self.assertIn("https://example.org/a", urls)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -198,7 +198,8 @@ class SearchAllowlist:
 
     @staticmethod
     def extract_urls(text: str) -> List[str]:
-        return re.findall(r"https?://[^\s)>\]\"]+", text)
+        urls = re.findall(r"https?://[^\s)>\]\"]+", text)
+        return [u.rstrip(".,);!?") for u in urls]
 
     @staticmethod
     def _normalize(url: str) -> str:
@@ -213,8 +214,8 @@ class SearchAllowlist:
 
 
 def html_to_markdown(html: str) -> str:
-    text = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
-    text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<script\b[\s\S]*?</script\s*>", "", html, flags=re.IGNORECASE)
+    text = re.sub(r"<style\b[\s\S]*?</style\s*>", "", text, flags=re.IGNORECASE)
     replacements = {
         r"</h[1-6]>": "\n\n",
         r"<h1[^>]*>": "# ",

@@ -24,7 +24,6 @@ Slash commands (with zh-TW localization):
 
 Owner text commands:
 - `!setpoints <user_id> <points>`
-- `!setrate <model> <rate>`
 
 ## Setup
 ```bash

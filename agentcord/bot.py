@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import py_compile
 from dataclasses import dataclass
@@ -75,7 +76,7 @@ class AIClient:
                 body = await resp.text()
                 if resp.status >= 400:
                     raise WorkspaceError(f"Pollinations request failed ({resp.status}): {body[:500]}")
-                data = await resp.json()
+                data = json.loads(body)
                 return data["choices"][0]["message"]["content"]
 
     async def call_custom_provider(
@@ -351,20 +352,6 @@ class AgentCordBot(commands.Bot):
             points = int(parts[2])
             self.points.set_points(user_id, points)
             await message.reply(f"Set points for {user_id} => {points}")
-            return
-
-        if message.content.startswith("!setrate"):
-            if message.author.id != self.cfg.owner_id:
-                await message.reply("Only owner can use this command.")
-                return
-            parts = message.content.split()
-            if len(parts) != 3 or not parts[2].isdigit():
-                await message.reply("Usage: !setrate <model> <rate>")
-                return
-            model = parts[1]
-            rate = int(parts[2])
-            PointsManager.DEFAULT_RATES[model] = rate
-            await message.reply(f"Set model rate: {model} => {rate}")
             return
 
         await self.process_commands(message)
