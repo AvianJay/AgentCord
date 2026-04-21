@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentcord"
+version = "0.1.0"
+description = "AI-powered coding agent Discord bot built with discord.py"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "aiohttp==3.13.5",
+  "discord.py==2.7.1",
+]
+
+[project.scripts]
+agentcord = "agentcord.bot:main"
+
+[tool.setuptools.packages.find]
+include = ["agentcord*"]
