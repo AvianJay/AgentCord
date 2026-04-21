@@ -44,7 +44,7 @@ Environment variables:
 ## Run
 
 ```bash
-python /home/runner/work/AgentCord/AgentCord/main.py
+python main.py
 ```
 
 ## Notes
