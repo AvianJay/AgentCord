@@ -78,7 +78,7 @@ class Database:
         self.ensure_user(user_id)
         balance = self.get_credits(user_id)
         if balance < amount:
-            raise ValueError("Insufficient credits.")
+            raise ValueError("額度不足。")
         with self._connection:
             self._connection.execute(
                 "UPDATE users SET credits = credits - ? WHERE user_id = ?",
@@ -132,7 +132,7 @@ class Database:
             )
         row = self._connection.execute("SELECT id, title FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
-            raise ValueError(f"Task {task_id} not found.")
+            raise ValueError(f"找不到任務 {task_id}。")
         return TaskRecord(
             id=int(row["id"]),
             title=row["title"],

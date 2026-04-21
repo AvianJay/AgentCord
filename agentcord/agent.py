@@ -34,8 +34,8 @@ class CreditManager:
         estimated_cost = (estimated_input_tokens + reserve) * rate
         if self.db.get_credits(user_id) < estimated_cost:
             raise ValueError(
-                f"Insufficient credits. Estimated minimum required: {estimated_cost:.2f}, "
-                f"available: {self.db.get_credits(user_id):.2f}."
+                f"額度不足。預估至少需要 {estimated_cost:.2f}，"
+                f"目前可用 {self.db.get_credits(user_id):.2f}。"
             )
 
     def charge(self, user_id: int, amount: float) -> float:
@@ -65,7 +65,7 @@ class CodingAgent:
         transcript: list[dict[str, str]] = []
         changed_files: set[str] = set()
         validations: list[str] = []
-        final_summary = "No changes were made."
+        final_summary = "未進行任何變更。"
 
         for _ in range(self.settings.agent_max_iterations):
             context = self._build_iteration_context(user_id, prompt, plan, transcript)
@@ -117,10 +117,10 @@ class CodingAgent:
         config: UserModelConfig,
     ) -> list[str]:
         planning_prompt = (
-            "Create a concise execution plan for the coding task below. "
-            "Return JSON with a single top-level key named plan containing a list of short strings.\n\n"
-            f"Workspace tree:\n{self.workspace.dump_tree(user_id)}\n\n"
-            f"Task:\n{prompt}"
+            "請為下列程式任務建立精簡的執行計畫。"
+            "請只回傳 JSON，最上層需包含名為 plan 的鍵，內容是繁體中文短句列表。\n\n"
+            f"工作區樹狀內容：\n{self.workspace.dump_tree(user_id)}\n\n"
+            f"任務：\n{prompt}"
         )
         self.credits.ensure_affordable(user_id, config, planning_prompt)
         response = await provider.generate(
@@ -132,7 +132,7 @@ class CodingAgent:
         self.credits.charge(user_id, response.usage.cost)
         data = parse_json_object(response.content)
         plan = [str(item) for item in data.get("plan", []) if str(item).strip()]
-        return plan or ["Review the request", "Update files", "Validate syntax"]
+        return plan or ["檢查需求", "更新檔案", "驗證語法"]
 
     def _build_iteration_context(
         self,
@@ -142,12 +142,12 @@ class CodingAgent:
         transcript: list[dict[str, str]],
     ) -> str:
         return (
-            f"User request:\n{prompt}\n\n"
-            f"Current plan:\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
-            f"Workspace tree:\n{self.workspace.dump_tree(user_id)}\n\n"
-            f"Prior tool transcript:\n{json.dumps(transcript[-6:], ensure_ascii=False, indent=2)}\n\n"
-            "Return JSON with keys summary, done, related_files, and actions. "
-            f"Use at most {self.settings.agent_max_actions_per_iteration} actions."
+            f"使用者需求：\n{prompt}\n\n"
+            f"目前計畫：\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
+            f"工作區樹狀內容：\n{self.workspace.dump_tree(user_id)}\n\n"
+            f"先前工具紀錄：\n{json.dumps(transcript[-6:], ensure_ascii=False, indent=2)}\n\n"
+            "請回傳 JSON，必須包含 summary、done、related_files、actions 這些鍵。"
+            f"actions 最多只能有 {self.settings.agent_max_actions_per_iteration} 個。"
         )
 
     async def _execute_actions(self, user_id: int, actions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
@@ -195,7 +195,7 @@ class CodingAgent:
                     outcome = await self._fetch_url(user_id, str(action["url"]))
                     results.append({"tool": tool_name, "url": action["url"], "result": outcome})
                 else:
-                    results.append({"tool": tool_name, "error": "Unsupported tool."})
+                    results.append({"tool": tool_name, "error": "不支援的工具。"})
             except (WorkspaceError, KeyError, ValueError, aiohttp.ClientError) as exc:
                 results.append({"tool": tool_name, "error": str(exc)})
         return results, touched_files
@@ -206,7 +206,7 @@ class CodingAgent:
             try:
                 validations.append(self.workspace.py_compile_check(user_id, path))
             except Exception as exc:  # noqa: BLE001
-                validations.append(f"Syntax error in {path}: {exc}")
+                validations.append(f"{path} 的語法錯誤：{exc}")
         return validations
 
     async def _search_web(self, user_id: int, query: str) -> dict[str, Any]:
@@ -221,8 +221,8 @@ class CodingAgent:
                 {
                     "role": "system",
                     "content": (
-                        "Search the web and return JSON with a top-level results list. "
-                        "Each item must include title, url, and summary."
+                        "請搜尋網路並回傳 JSON，最上層需有 results 清單。"
+                        "每個項目都必須包含 title、url、summary。"
                     ),
                 },
                 {"role": "user", "content": query},
@@ -235,29 +235,31 @@ class CodingAgent:
 
     async def _fetch_url(self, user_id: int, url: str) -> str:
         if not self.db.is_allowed_url(user_id, url):
-            raise ValueError("fetch_url is only allowed for URLs returned by search_web.")
+            raise ValueError("fetch_url 只能存取由 search_web 回傳的 URL。")
         async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as response:
             response.raise_for_status()
             return await response.text()
 
 
 _PLANNING_SYSTEM_PROMPT = """
-You are an AI coding planner for a Discord bot workspace.
-Return valid JSON only.
+你是 Discord bot 工作區的 AI 程式規劃器。
+只回傳合法 JSON。
+plan 內容請使用繁體中文。
 """
 
 
 _AGENT_SYSTEM_PROMPT = """
-You are an AI coding agent operating in a sandboxed text-file workspace.
-Important rules:
-- Users cannot execute code.
-- Only use these tools: read_file, write_file, list_files, delete_file, create_folder, apply_patch, py_compile_check, search_web, fetch_url.
-- Prefer apply_patch when editing an existing file.
-- Only write UTF-8 text files.
-- Return valid JSON only.
+你是運行在受限文字檔工作區中的 AI 程式代理。
+重要規則：
+- 使用者不能執行程式碼。
+- 只能使用這些工具：read_file, write_file, list_files, delete_file, create_folder, apply_patch, py_compile_check, search_web, fetch_url。
+- 編輯既有檔案時優先使用 apply_patch。
+- 只可寫入 UTF-8 文字檔。
+- 只回傳合法 JSON。
+- summary 與 plan 內容請使用繁體中文。
 - JSON schema:
   {
-    "summary": "short summary",
+        "summary": "簡短摘要",
     "done": true|false,
     "related_files": ["path"],
     "actions": [

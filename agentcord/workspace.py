@@ -38,7 +38,7 @@ class WorkspaceManager:
     def read_file(self, user_id: int, path: str) -> str:
         absolute = self._resolve_path(user_id, path)
         if not absolute.is_file():
-            raise WorkspaceError(f"File not found: {path}")
+            raise WorkspaceError(f"找不到檔案：{path}")
         return absolute.read_text(encoding="utf-8")
 
     def write_file(self, user_id: int, path: str, content: str) -> int:
@@ -50,7 +50,7 @@ class WorkspaceManager:
         new_total = self.total_size(user_id) - existing_size + len(encoded)
         if new_total > self._limit_bytes:
             raise WorkspaceError(
-                f"Write rejected: workspace would exceed {self._limit_bytes} bytes."
+                f"寫入遭拒：工作區將超過 {self._limit_bytes} 位元組上限。"
             )
         absolute.write_bytes(encoded)
         return len(encoded)
@@ -58,7 +58,7 @@ class WorkspaceManager:
     def list_files(self, user_id: int, path: str = ".") -> list[WorkspaceEntry]:
         absolute = self._resolve_path(user_id, path)
         if not absolute.exists():
-            raise WorkspaceError(f"Path not found: {path}")
+            raise WorkspaceError(f"找不到路徑：{path}")
         if absolute.is_file():
             return [WorkspaceEntry(path=self._to_relative(user_id, absolute), kind="file", size=absolute.stat().st_size)]
 
@@ -74,9 +74,9 @@ class WorkspaceManager:
     def delete_file(self, user_id: int, path: str) -> None:
         absolute = self._resolve_path(user_id, path)
         if absolute.is_dir():
-            raise WorkspaceError("delete_file only supports files.")
+            raise WorkspaceError("delete_file 只支援刪除檔案。")
         if not absolute.exists():
-            raise WorkspaceError(f"File not found: {path}")
+            raise WorkspaceError(f"找不到檔案：{path}")
         absolute.unlink()
 
     def create_folder(self, user_id: int, path: str) -> str:
@@ -96,13 +96,13 @@ class WorkspaceManager:
     def py_compile_check(self, user_id: int, path: str) -> str:
         absolute = self._resolve_path(user_id, path)
         if absolute.suffix != ".py":
-            return f"Skipped syntax validation for {path}: only Python files are supported."
+            return f"已略過 {path} 的語法驗證：僅支援 Python 檔案。"
         if not absolute.exists():
-            raise WorkspaceError(f"File not found: {path}")
+            raise WorkspaceError(f"找不到檔案：{path}")
         with tempfile.TemporaryDirectory() as tmp_dir:
             pyc_path = Path(tmp_dir) / "check.pyc"
             py_compile.compile(str(absolute), cfile=str(pyc_path), doraise=True)
-        return f"Syntax OK: {path}"
+        return f"語法檢查通過：{path}"
 
     def apply_patch(self, user_id: int, diff_text: str) -> list[str]:
         file_diffs = self._parse_unified_diff(diff_text)
@@ -138,12 +138,12 @@ class WorkspaceManager:
                     payload = line[1:]
                     if prefix == " ":
                         if cursor >= len(original_lines) or original_lines[cursor] != payload:
-                            raise WorkspaceError(f"Patch context mismatch for {source_path}.")
+                            raise WorkspaceError(f"Patch 上下文與 {source_path} 不符。")
                         result_lines.append(payload)
                         cursor += 1
                     elif prefix == "-":
                         if cursor >= len(original_lines) or original_lines[cursor] != payload:
-                            raise WorkspaceError(f"Patch deletion mismatch for {source_path}.")
+                            raise WorkspaceError(f"Patch 刪除內容與 {source_path} 不符。")
                         cursor += 1
                     elif prefix == "+":
                         result_lines.append(payload)
@@ -168,7 +168,7 @@ class WorkspaceManager:
             current_total += len(new_content.encode("utf-8"))
         if current_total > self._limit_bytes:
             raise WorkspaceError(
-                f"Patch rejected: workspace would exceed {self._limit_bytes} bytes."
+                f"Patch 遭拒：工作區將超過 {self._limit_bytes} 位元組上限。"
             )
 
         for relative_path, new_content in updated_contents.items():
@@ -187,7 +187,7 @@ class WorkspaceManager:
             return root
         absolute = (root / relative).resolve()
         if root not in absolute.parents and absolute != root:
-            raise WorkspaceError("Path traversal is not allowed.")
+            raise WorkspaceError("不允許路徑跳脫。")
         return absolute
 
     def _normalize_relative_path(self, path: str) -> str:
@@ -196,7 +196,7 @@ class WorkspaceManager:
             return "."
         pure = PurePosixPath(cleaned)
         if pure.is_absolute() or ".." in pure.parts:
-            raise WorkspaceError("Path traversal is not allowed.")
+            raise WorkspaceError("不允許路徑跳脫。")
         parts = [part for part in pure.parts if part not in ("", ".")]
         if not parts:
             return "."
@@ -208,13 +208,13 @@ class WorkspaceManager:
 
     def _assert_text(self, content: str) -> None:
         if "\x00" in content:
-            raise WorkspaceError("Only UTF-8 text files are allowed.")
+            raise WorkspaceError("只允許 UTF-8 文字檔。")
         content.encode("utf-8")
 
     def _parse_unified_diff(self, diff_text: str) -> list[dict]:
         lines = diff_text.splitlines(keepends=True)
         if not lines:
-            raise WorkspaceError("Patch is empty.")
+            raise WorkspaceError("Patch 內容不可為空。")
 
         files: list[dict] = []
         index = 0
@@ -227,7 +227,7 @@ class WorkspaceManager:
                 old_path = self._strip_diff_path(line[4:].strip())
                 index += 1
                 if index >= len(lines) or not lines[index].startswith("+++ "):
-                    raise WorkspaceError("Invalid patch: missing new path.")
+                    raise WorkspaceError("Patch 格式無效：缺少新路徑。")
                 new_path = self._strip_diff_path(lines[index][4:].strip())
                 index += 1
                 hunks: list[dict] = []
@@ -258,7 +258,7 @@ class WorkspaceManager:
                 continue
             index += 1
         if not files:
-            raise WorkspaceError("Invalid patch: no file sections found.")
+            raise WorkspaceError("Patch 格式無效：找不到檔案區段。")
         return files
 
     def _parse_hunk_header(self, header: str) -> tuple[int, int, int, int]:

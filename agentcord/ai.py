@@ -148,13 +148,13 @@ def create_provider(
         return OpenAICompatibleProvider(session, settings, config, "https://api.x.ai/v1")
     if config.provider is Provider.CUSTOM:
         if not settings.custom_provider_base_url:
-            raise ValueError("AGENTCORD_CUSTOM_PROVIDER_BASE_URL is required for custom providers.")
+            raise ValueError("自訂供應商必須設定 AGENTCORD_CUSTOM_PROVIDER_BASE_URL。")
         return OpenAICompatibleProvider(session, settings, config, settings.custom_provider_base_url)
     if config.provider is Provider.ANTHROPIC:
         return AnthropicProvider(session, settings, config)
     if config.provider is Provider.GOOGLE:
         return GoogleProvider(session, settings, config)
-    raise ValueError(f"Unsupported provider: {config.provider}")
+    raise ValueError(f"不支援的供應商：{config.provider}")
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -166,5 +166,5 @@ def parse_json_object(text: str) -> dict[str, Any]:
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or start >= end:
-        raise ValueError("Model output did not contain a JSON object.")
+        raise ValueError("模型輸出不包含 JSON 物件。")
     return json.loads(cleaned[start : end + 1])
