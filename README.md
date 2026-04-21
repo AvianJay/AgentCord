@@ -35,6 +35,7 @@ Environment variables:
 - `DISCORD_TOKEN` (required)
 - `DISCORD_APPLICATION_ID` (recommended)
 - `BOT_OWNER_ID` (required for `!add_credits`)
+- `DISCORD_LOG_WEBHOOK` (optional, sends batched webhook embeds for command and agent activity logs)
 - `POLLINATIONS_API_KEY` (optional, used for Pollinations and search)
 - `AGENTCORD_CUSTOM_PROVIDER_BASE_URL` (required when provider is `custom`)
 - `AGENTCORD_DATA_DIR` (defaults to `./data`)
@@ -52,3 +53,4 @@ python main.py
 - Users cannot execute code; the bot only generates and edits files.
 - Python validation uses syntax-only compilation via `py_compile`.
 - Existing file edits are designed to prefer unified diff patches over full overwrites during agent runs.
+- When `DISCORD_LOG_WEBHOOK` is set, command usage, agent session actions, and execution errors are queued and sent to the webhook in embed batches.

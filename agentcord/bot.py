@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import traceback
 from pathlib import Path
 
 import aiohttp
@@ -13,6 +14,7 @@ from agentcord.agent import CodingAgent, CreditManager
 from agentcord.ai import create_provider, fetch_pollinations_models, resolve_pollinations_model
 from agentcord.config import Settings
 from agentcord.database import Database
+from agentcord.logger import DiscordWebhookLogger
 from agentcord.live_agent import AgentConversationSession
 from agentcord.models import Provider, TaskRecord, TaskStatus, UserModelConfig
 from agentcord.workspace import WorkspaceError, WorkspaceManager
@@ -75,9 +77,12 @@ class AgentCordBot(commands.Bot):
         self.credits = CreditManager(self.db, settings)
         self.agent: CodingAgent | None = None
         self.agent_sessions: dict[int, AgentConversationSession] = {}
+        self.logger: DiscordWebhookLogger | None = None
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
+        if self.settings.discord_log_webhook:
+            self.logger = DiscordWebhookLogger(self.settings.discord_log_webhook, self.http_session)
         self.agent = CodingAgent(self.settings, self.db, self.workspace, self.http_session)
         register_commands(self)
         await self.tree.set_translator(CommandNameTranslator())
@@ -87,13 +92,95 @@ class AgentCordBot(commands.Bot):
         for session in list(self.agent_sessions.values()):
             await session.close("Bot 正在關閉，這個對話已停止更新。")
         self.agent_sessions.clear()
+        if self.logger is not None:
+            await self.logger.close()
+            self.logger = None
         if self.http_session is not None:
             await self.http_session.close()
         self.db.close()
         await super().close()
 
+    async def log_event(
+        self,
+        title: str,
+        description: str,
+        *,
+        user: discord.abc.User | None = None,
+        guild: discord.Guild | None = None,
+        color: discord.Colour | None = None,
+        fields: list[tuple[str, str, bool]] | None = None,
+    ) -> None:
+        if self.logger is None:
+            return
+        await self.logger.log(
+            title,
+            description,
+            user=user,
+            guild=guild,
+            color=color,
+            fields=fields,
+        )
+
+    async def log_exception(
+        self,
+        title: str,
+        error: BaseException,
+        *,
+        user: discord.abc.User | None = None,
+        guild: discord.Guild | None = None,
+        details: str = "",
+        fields: list[tuple[str, str, bool]] | None = None,
+    ) -> None:
+        if self.logger is None:
+            return
+        await self.logger.log_exception(
+            title,
+            error,
+            user=user,
+            guild=guild,
+            details=details,
+            fields=fields,
+        )
+
 
 def register_commands(bot: AgentCordBot) -> None:
+    def preview_text(text: str, limit: int = 300) -> str:
+        normalized = " ".join(text.split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 3] + "..."
+
+    async def log_interaction(
+        interaction: discord.Interaction,
+        description: str,
+        *,
+        fields: list[tuple[str, str, bool]] | None = None,
+        color: discord.Colour | None = None,
+    ) -> None:
+        command_name = interaction.command.qualified_name if interaction.command else "interaction"
+        await bot.log_event(
+            f"/{command_name}",
+            description,
+            user=interaction.user,
+            guild=interaction.guild,
+            color=color,
+            fields=fields,
+        )
+
+    async def log_command_error(interaction: discord.Interaction, error: BaseException) -> None:
+        command_name = interaction.command.qualified_name if interaction.command else "interaction"
+        fields: list[tuple[str, str, bool]] = []
+        if interaction.channel is not None and hasattr(interaction.channel, "id"):
+            fields.append(("頻道", str(interaction.channel.id), True))
+        await bot.log_exception(
+            f"/{command_name} 失敗",
+            error,
+            user=interaction.user,
+            guild=interaction.guild,
+            details="應用程式指令執行失敗。",
+            fields=fields,
+        )
+
     async def close_replaceable_session(user_id: int) -> None:
         existing_session = bot.agent_sessions.get(user_id)
         if existing_session is None:
@@ -174,6 +261,14 @@ def register_commands(bot: AgentCordBot) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         response = await provider.generate(messages)
         remaining = bot.credits.charge(interaction.user.id, response.usage.cost)
+        await log_interaction(
+            interaction,
+            f"使用 /ask 提問。\nPrompt: {preview_text(prompt)}",
+            fields=[
+                ("模型", f"{config.provider.value}/{config.model}", True),
+                ("花費", f"{response.usage.cost:.2f}", True),
+            ],
+        )
         reply = (
             f"{response.content}\n\n"
             f"已使用額度：{response.usage.cost:.2f} "
@@ -191,17 +286,31 @@ def register_commands(bot: AgentCordBot) -> None:
     async def agent_command(interaction: discord.Interaction, prompt: str) -> None:
         assert bot.agent is not None
         session = await start_new_agent_session(interaction, prompt)
+        await log_interaction(
+            interaction,
+            f"建立新的 agent 對話。\nPrompt: {preview_text(prompt)}",
+            fields=[("Task ID", str(session.task_id), True)],
+        )
         await session.enqueue_prompt(prompt)
 
     @bot.tree.command(name="call-ai-codeing", description="/agent 的別名。")
     @app_commands.describe(prompt="描述要讓代理建立或修改的內容。")
     async def agent_alias(interaction: discord.Interaction, prompt: str) -> None:
         session = await start_new_agent_session(interaction, prompt)
+        await log_interaction(
+            interaction,
+            f"透過 alias 建立新的 agent 對話。\nPrompt: {preview_text(prompt)}",
+            fields=[("Task ID", str(session.task_id), True)],
+        )
         await session.enqueue_prompt(prompt)
 
     @bot.tree.command(name="agent-history", description="查看最近 20 筆 agent 對話。")
     async def agent_history(interaction: discord.Interaction) -> None:
         tasks = bot.db.list_tasks(interaction.user.id, limit=20)
+        await log_interaction(
+            interaction,
+            f"查看 agent 歷史，共 {len(tasks)} 筆。",
+        )
         if not tasks:
             await interaction.response.send_message("目前沒有任何 agent 對話歷史。")
             return
@@ -225,6 +334,11 @@ def register_commands(bot: AgentCordBot) -> None:
     async def agent_open(interaction: discord.Interaction, task_id: int, prompt: str | None = None) -> None:
         task = bot.db.get_task(interaction.user.id, task_id)
         session = await open_agent_session(interaction, task, reopened=True)
+        await log_interaction(
+            interaction,
+            "重新打開既有 agent 對話。" + (f"\nPrompt: {preview_text(prompt)}" if prompt else ""),
+            fields=[("Task ID", str(task_id), True)],
+        )
         if prompt and prompt.strip():
             await session.enqueue_prompt(prompt)
 
@@ -239,6 +353,14 @@ def register_commands(bot: AgentCordBot) -> None:
             raise ValueError("/set-model 只允許選擇免費模型。")
         config = UserModelConfig(provider=Provider.POLLINATIONS, model=model, api_key=bot.settings.pollinations_api_key)
         bot.db.set_model_config(interaction.user.id, config)
+        await log_interaction(
+            interaction,
+            "更新 Pollinations 模型設定。",
+            fields=[
+                ("模型", model, True),
+                ("Context", str(model_info.context_length or "?"), True),
+            ],
+        )
         await interaction.response.send_message(
             f"模型已設定為 Pollinations/{model}。", ephemeral=True
         )
@@ -283,6 +405,14 @@ def register_commands(bot: AgentCordBot) -> None:
             raise ValueError(f"不支援的供應商：{provider}") from exc
         config = UserModelConfig(provider=provider_value, api_key=api_key.strip(), model=model.strip())
         bot.db.set_model_config(interaction.user.id, config)
+        await log_interaction(
+            interaction,
+            "更新自訂模型設定。",
+            fields=[
+                ("供應商", config.provider.value, True),
+                ("模型", config.model, True),
+            ],
+        )
         await interaction.response.send_message(
             f"自訂模型已設定為 {config.provider.value}/{config.model}。",
             ephemeral=True,
@@ -295,6 +425,14 @@ def register_commands(bot: AgentCordBot) -> None:
     async def file_list(interaction: discord.Interaction, path: str = ".") -> None:
         entries = bot.workspace.list_files(interaction.user.id, path)
         total_size = bot.workspace.total_size(interaction.user.id)
+        await log_interaction(
+            interaction,
+            "列出工作區路徑。",
+            fields=[
+                ("路徑", path, True),
+                ("項目數", str(len(entries)), True),
+            ],
+        )
         kind_labels = {"file": "檔案", "folder": "資料夾"}
         lines = [
             f"{kind_labels.get(entry.kind, entry.kind)} {entry.size:>8} {entry.path}"
@@ -308,6 +446,14 @@ def register_commands(bot: AgentCordBot) -> None:
     @file_manager.command(name="read", description="讀取文字檔。")
     async def file_read(interaction: discord.Interaction, path: str) -> None:
         content = bot.workspace.read_file(interaction.user.id, path)
+        await log_interaction(
+            interaction,
+            "讀取工作區檔案。",
+            fields=[
+                ("路徑", path, True),
+                ("大小", str(len(content.encode('utf-8'))), True),
+            ],
+        )
         if len(content) <= 1800:
             await interaction.response.send_message(f"```text\n{content}\n```", ephemeral=True)
             return
@@ -318,6 +464,14 @@ def register_commands(bot: AgentCordBot) -> None:
     async def file_write(interaction: discord.Interaction, path: str, content: str) -> None:
         size = bot.workspace.write_file(interaction.user.id, path, content)
         total_size = bot.workspace.total_size(interaction.user.id)
+        await log_interaction(
+            interaction,
+            "寫入工作區檔案。",
+            fields=[
+                ("路徑", path, True),
+                ("位元組", str(size), True),
+            ],
+        )
         await interaction.response.send_message(
             f"已寫入 {size} 位元組到 {path}。工作區用量：{total_size}/{bot.settings.workspace_limit_bytes}。",
             ephemeral=True,
@@ -326,11 +480,21 @@ def register_commands(bot: AgentCordBot) -> None:
     @file_manager.command(name="delete", description="刪除檔案。")
     async def file_delete(interaction: discord.Interaction, path: str) -> None:
         bot.workspace.delete_file(interaction.user.id, path)
+        await log_interaction(
+            interaction,
+            "刪除工作區檔案。",
+            fields=[("路徑", path, True)],
+        )
         await interaction.response.send_message(f"已刪除 {path}。", ephemeral=True)
 
     @file_manager.command(name="mkdir", description="建立資料夾。")
     async def file_mkdir(interaction: discord.Interaction, path: str) -> None:
         created_path = bot.workspace.create_folder(interaction.user.id, path)
+        await log_interaction(
+            interaction,
+            "建立工作區資料夾。",
+            fields=[("路徑", created_path, True)],
+        )
         await interaction.response.send_message(f"已建立資料夾 {created_path}。", ephemeral=True)
 
     bot.tree.add_command(file_manager)
@@ -341,14 +505,41 @@ def register_commands(bot: AgentCordBot) -> None:
         export_path = bot.settings.data_dir / "exports" / f"{interaction.user.id}.zip"
         bot.workspace.export_zip(interaction.user.id, export_path)
         file = discord.File(export_path, filename=f"workspace-{interaction.user.id}.zip")
+        await log_interaction(
+            interaction,
+            "匯出工作區 zip。",
+            fields=[("檔案", export_path.name, True)],
+        )
         await interaction.followup.send("工作區匯出已準備完成。", file=file, ephemeral=True)
 
     @bot.command(name="add_credits")
     async def add_credits(ctx: commands.Context[AgentCordBot], member: discord.User, amount: float) -> None:
         if bot.settings.bot_owner_id is not None and ctx.author.id != bot.settings.bot_owner_id:
+            await bot.log_event(
+                "!add_credits",
+                "非擁有者嘗試調整額度。",
+                user=ctx.author,
+                guild=ctx.guild,
+                color=discord.Colour.orange(),
+                fields=[
+                    ("目標", str(member.id), True),
+                    ("金額", f"{amount:.2f}", True),
+                ],
+            )
             await ctx.reply("只有設定中的擁有者可以調整額度。")
             return
         balance = bot.db.add_credits(member.id, amount)
+        await bot.log_event(
+            "!add_credits",
+            "已調整使用者額度。",
+            user=ctx.author,
+            guild=ctx.guild,
+            fields=[
+                ("目標", f"{member} ({member.id})", False),
+                ("金額", f"{amount:.2f}", True),
+                ("新餘額", f"{balance:.2f}", True),
+            ],
+        )
         await ctx.reply(f"已為 {member.mention} 調整 {amount:.2f} 額度。新餘額：{balance:.2f}")
 
     @ask.error
@@ -367,6 +558,7 @@ def register_commands(bot: AgentCordBot) -> None:
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         original = getattr(error, "original", error)
         message = str(original)
+        await log_command_error(interaction, original if isinstance(original, BaseException) else Exception(message))
         if isinstance(original, (WorkspaceError, ValueError, aiohttp.ClientError)):
             if isinstance(original, aiohttp.ClientError):
                 message = f"網路請求失敗：{message or type(original).__name__}"
@@ -380,6 +572,13 @@ def register_commands(bot: AgentCordBot) -> None:
 
     @add_credits.error
     async def on_add_credits_error(ctx: commands.Context[AgentCordBot], error: commands.CommandError) -> None:
+        await bot.log_exception(
+            "!add_credits 失敗",
+            error,
+            user=ctx.author,
+            guild=ctx.guild,
+            details="prefix 指令執行失敗。",
+        )
         await ctx.reply(f"指令執行失敗：{error}")
 
 

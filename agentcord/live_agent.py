@@ -31,6 +31,7 @@ class AgentConversationSession:
         self.bot = bot
         self.user = user
         self.task_record = task
+        self.guild: discord.Guild | None = None
         self.task_items = list(task.task_items)
         self.context_state = ContextWindowState(
             model=task.model,
@@ -58,6 +59,7 @@ class AgentConversationSession:
         return (self._current_run_task is not None and not self._current_run_task.done()) or not self._prompt_queue.empty()
 
     async def open(self, interaction: discord.Interaction, *, reopened: bool = False) -> None:
+        self.guild = interaction.guild
         if reopened:
             self._append_activity(f"已重新打開對話 #{self.task_record.id}。")
         self.view.sync_layout()
@@ -76,6 +78,12 @@ class AgentConversationSession:
         if self._closed:
             raise ValueError("這個對話已關閉，請重新開啟新的對話。")
         await self._prompt_queue.put(prompt)
+        await self.bot.log_event(
+            "Agent 對話訊息",
+            f"送出 agent 對話訊息。\nTask ID: {self.task_record.id}\nPrompt: {self._shorten(' '.join(prompt.split()), 300)}",
+            user=self.user,
+            guild=self.guild,
+        )
         if self._current_run_task is not None and not self._current_run_task.done():
             self._append_activity("已將新的使用者訊息加入佇列。")
         else:
@@ -95,6 +103,13 @@ class AgentConversationSession:
             await self.request_render(force=True)
             return
         self._append_activity("已要求中斷目前的 agent 執行。")
+        await self.bot.log_event(
+            "Agent 中斷",
+            f"要求中斷 agent 對話。\nTask ID: {self.task_record.id}",
+            user=self.user,
+            guild=self.guild,
+            color=discord.Colour.orange(),
+        )
         self._current_run_task.cancel()
         await self.request_render(force=True)
 
@@ -195,6 +210,13 @@ class AgentConversationSession:
                     compression_count=self.context_state.compression_count,
                 )
                 self._append_activity("本輪執行已被中斷。")
+                await self.bot.log_event(
+                    "Agent 已中斷",
+                    f"agent 對話已中斷。\nTask ID: {self.task_record.id}",
+                    user=self.user,
+                    guild=self.guild,
+                    color=discord.Colour.orange(),
+                )
             except Exception as exc:  # noqa: BLE001
                 self.task_record = self.bot.db.get_task_by_id(self.task_record.id)
                 self.task_record = self.bot.db.update_task(
@@ -211,6 +233,13 @@ class AgentConversationSession:
                     compression_count=self.context_state.compression_count,
                 )
                 self._append_activity(f"本輪執行失敗：{exc}")
+                await self.bot.log_exception(
+                    "Agent 執行失敗",
+                    exc,
+                    user=self.user,
+                    guild=self.guild,
+                    details=f"Task ID: {self.task_record.id}",
+                )
             else:
                 self.task_record = self.bot.db.get_task(self.user.id, result.task_id or self.task_record.id)
                 self.task_items = list(result.task_items)
@@ -221,6 +250,17 @@ class AgentConversationSession:
                 self.context_state.history_messages = len(result.messages)
                 self.context_state.phase = "completed"
                 self._append_activity(f"本輪完成：{result.summary}")
+                await self.bot.log_event(
+                    "Agent 完成",
+                    f"agent 對話完成。\nTask ID: {self.task_record.id}\nSummary: {self._shorten(result.summary, 300)}",
+                    user=self.user,
+                    guild=self.guild,
+                    fields=[
+                        ("檔案數", str(len(result.related_files)), True),
+                        ("驗證數", str(len(result.validations)), True),
+                    ],
+                    color=discord.Colour.green(),
+                )
             finally:
                 self._current_run_task = None
                 await self.request_render(force=True)

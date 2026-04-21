@@ -25,6 +25,7 @@ class Settings:
     discord_token: str
     discord_application_id: int | None
     bot_owner_id: int | None
+    discord_log_webhook: str
     data_dir: Path
     workspace_limit_bytes: int
     default_credits: float
@@ -47,6 +48,7 @@ class Settings:
             discord_token=os.getenv("DISCORD_TOKEN", "").strip(),
             discord_application_id=_optional_int(os.getenv("DISCORD_APPLICATION_ID")),
             bot_owner_id=_optional_int(os.getenv("BOT_OWNER_ID")),
+            discord_log_webhook=os.getenv("DISCORD_LOG_WEBHOOK", "").strip(),
             data_dir=Path(os.getenv("AGENTCORD_DATA_DIR", "data")).resolve(),
             workspace_limit_bytes=int(os.getenv("AGENTCORD_WORKSPACE_LIMIT_BYTES", str(5 * 1024 * 1024))),
             default_credits=float(os.getenv("AGENTCORD_DEFAULT_CREDITS", "100")),
