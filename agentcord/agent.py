@@ -78,6 +78,7 @@ class CodingAgent:
         if config.provider is Provider.POLLINATIONS:
             model_info = await resolve_pollinations_model(self.session, self.settings, config.model)
         context_length = model_info.context_length if model_info is not None else None
+        actual_model = config.model
 
         history_messages = list(task.messages) if task is not None else []
         history_messages.append(ConversationMessage(role="user", content=prompt))
@@ -98,7 +99,7 @@ class CodingAgent:
                 title=prompt[:120],
                 status=TaskStatus.RUNNING,
                 messages=history_messages,
-                model=config.model,
+                model=actual_model,
                 context_length=context_length,
                 compression_count=compression_count,
             )
@@ -108,7 +109,7 @@ class CodingAgent:
                 TaskStatus.RUNNING,
                 task.related_files,
                 messages=history_messages,
-                model=config.model,
+                model=actual_model,
                 context_length=context_length,
                 compression_count=compression_count,
             )
@@ -122,7 +123,16 @@ class CodingAgent:
             },
         )
 
-        plan = await self._create_plan(user_id, prompt, provider, config, history_messages, progress_callback, context_length)
+        plan, actual_model = await self._create_plan(
+            user_id,
+            prompt,
+            provider,
+            config,
+            history_messages,
+            progress_callback,
+            context_length,
+            actual_model,
+        )
         transcript: list[dict[str, str]] = []
         changed_files: set[str] = set(task.related_files)
         validations: list[str] = []
@@ -137,7 +147,7 @@ class CodingAgent:
                 progress_callback,
                 {
                     "type": "context",
-                    "model": config.model,
+                    "model": actual_model,
                     "context_length": context_length,
                     "estimated_tokens": estimated_tokens,
                     "compression_count": compression_count,
@@ -163,6 +173,19 @@ class CodingAgent:
                 ),
             )
             self.credits.charge(user_id, step_response.usage.cost)
+            actual_model = step_response.model or actual_model
+            await self._emit_progress(
+                progress_callback,
+                {
+                    "type": "context",
+                    "model": actual_model,
+                    "context_length": context_length,
+                    "estimated_tokens": estimated_tokens,
+                    "compression_count": compression_count,
+                    "history_messages": len(history_messages),
+                    "phase": f"iteration-{iteration}",
+                },
+            )
             decision = parse_json_object(step_response.content)
             await self._remove_activity(progress_callback, activity_key=f"decision:{iteration}")
             tool_results, touched_files, current_task_items = await self._execute_actions(
@@ -214,7 +237,7 @@ class CodingAgent:
             validations=validations,
             messages=history_messages,
             task_items=current_task_items,
-            model=config.model,
+            model=actual_model,
             context_length=context_length,
             compression_count=compression_count,
         )
@@ -233,7 +256,7 @@ class CodingAgent:
             validations=validations,
             messages=history_messages,
             task_items=current_task_items,
-            model=config.model,
+            model=actual_model,
             context_length=context_length,
             estimated_tokens=estimated_tokens,
             compression_count=compression_count,
@@ -249,7 +272,8 @@ class CodingAgent:
         history_messages: list[ConversationMessage],
         progress_callback: ProgressCallback | None,
         context_length: int | None,
-    ) -> list[str]:
+        current_model: str,
+    ) -> tuple[list[str], str]:
         planning_prompt = (
             "請為下列程式任務建立精簡的執行計畫。"
             "請只回傳 JSON，最上層需包含名為 plan 的鍵，內容是繁體中文短句列表。\n\n"
@@ -261,7 +285,7 @@ class CodingAgent:
             progress_callback,
             {
                 "type": "context",
-                "model": config.model,
+                "model": current_model,
                 "context_length": context_length,
                 "estimated_tokens": estimate_tokens(planning_prompt),
                 "compression_count": 0,
@@ -287,6 +311,19 @@ class CodingAgent:
             ),
         )
         self.credits.charge(user_id, response.usage.cost)
+        resolved_model = response.model or current_model
+        await self._emit_progress(
+            progress_callback,
+            {
+                "type": "context",
+                "model": resolved_model,
+                "context_length": context_length,
+                "estimated_tokens": estimate_tokens(planning_prompt),
+                "compression_count": 0,
+                "history_messages": len(history_messages),
+                "phase": "planning",
+            },
+        )
         data = parse_json_object(response.content)
         plan = [str(item) for item in data.get("plan", []) if str(item).strip()]
         await self._emit_activity(
@@ -294,7 +331,7 @@ class CodingAgent:
             f"計畫生成已完成，共 {len(plan or [])} 個步驟。",
             activity_key="plan",
         )
-        return plan or ["檢查需求", "更新檔案", "驗證語法"]
+        return plan or ["檢查需求", "更新檔案", "驗證語法"], resolved_model
 
     def _build_iteration_context(
         self,

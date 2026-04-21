@@ -53,6 +53,7 @@ class AIUsage:
 class AIResponse:
     content: str
     usage: AIUsage
+    model: str = ""
     raw_response: dict[str, Any] = field(default_factory=dict)
 
 

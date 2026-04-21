@@ -14,6 +14,16 @@ _POLLINATIONS_MODELS_CACHE_TTL = 900.0
 _pollinations_models_cache: tuple[float, list[PollinationsModelInfo], dict[str, PollinationsModelInfo]] | None = None
 
 
+def _resolve_response_model(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("model", "model_name", "modelVersion", "resolved_model"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _request_timeout() -> aiohttp.ClientTimeout:
     return aiohttp.ClientTimeout(total=180, connect=30, sock_connect=30, sock_read=180)
 
@@ -78,7 +88,12 @@ class PollinationsProvider(AIProvider):
             response.raise_for_status()
             data = await response.json()
         content = data["choices"][0]["message"]["content"]
-        return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response=data)
+        return AIResponse(
+            content=content,
+            usage=self._build_usage(messages, content),
+            model=_resolve_response_model(data) or self.config.model,
+            raw_response=data,
+        )
 
     async def stream_generate(
         self,
@@ -109,9 +124,15 @@ class PollinationsProvider(AIProvider):
                     maybe_result = on_delta(content)
                     if maybe_result is not None:
                         await maybe_result
-                return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response=data)
+                return AIResponse(
+                    content=content,
+                    usage=self._build_usage(messages, content),
+                    model=_resolve_response_model(data) or self.config.model,
+                    raw_response=data,
+                )
 
             content_parts: list[str] = []
+            response_model = ""
             async for raw_line in response.content:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
                 if not line or not line.startswith("data:"):
@@ -123,6 +144,7 @@ class PollinationsProvider(AIProvider):
                     chunk = json.loads(payload_line)
                 except json.JSONDecodeError:
                     continue
+                response_model = _resolve_response_model(chunk) or response_model
                 delta = _extract_stream_text(chunk)
                 if not delta:
                     continue
@@ -133,7 +155,13 @@ class PollinationsProvider(AIProvider):
                         await maybe_result
 
         content = "".join(content_parts)
-        return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response={"stream": True})
+        resolved_model = response_model or self.config.model
+        return AIResponse(
+            content=content,
+            usage=self._build_usage(messages, content),
+            model=resolved_model,
+            raw_response={"stream": True, "model": resolved_model},
+        )
 
 
 class OpenAICompatibleProvider(AIProvider):
@@ -166,7 +194,12 @@ class OpenAICompatibleProvider(AIProvider):
             response.raise_for_status()
             data = await response.json()
         content = data["choices"][0]["message"]["content"]
-        return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response=data)
+        return AIResponse(
+            content=content,
+            usage=self._build_usage(messages, content),
+            model=_resolve_response_model(data) or self.config.model,
+            raw_response=data,
+        )
 
     async def stream_generate(
         self,
@@ -198,9 +231,15 @@ class OpenAICompatibleProvider(AIProvider):
                     maybe_result = on_delta(content)
                     if maybe_result is not None:
                         await maybe_result
-                return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response=data)
+                return AIResponse(
+                    content=content,
+                    usage=self._build_usage(messages, content),
+                    model=_resolve_response_model(data) or self.config.model,
+                    raw_response=data,
+                )
 
             content_parts: list[str] = []
+            response_model = ""
             async for raw_line in response.content:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
                 if not line or not line.startswith("data:"):
@@ -212,6 +251,7 @@ class OpenAICompatibleProvider(AIProvider):
                     chunk = json.loads(payload_line)
                 except json.JSONDecodeError:
                     continue
+                response_model = _resolve_response_model(chunk) or response_model
                 delta = _extract_stream_text(chunk)
                 if not delta:
                     continue
@@ -222,7 +262,13 @@ class OpenAICompatibleProvider(AIProvider):
                         await maybe_result
 
         content = "".join(content_parts)
-        return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response={"stream": True})
+        resolved_model = response_model or self.config.model
+        return AIResponse(
+            content=content,
+            usage=self._build_usage(messages, content),
+            model=resolved_model,
+            raw_response={"stream": True, "model": resolved_model},
+        )
 
 
 class AnthropicProvider(AIProvider):
@@ -252,7 +298,12 @@ class AnthropicProvider(AIProvider):
             response.raise_for_status()
             data = await response.json()
         content = "".join(block["text"] for block in data.get("content", []) if block.get("type") == "text")
-        return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response=data)
+        return AIResponse(
+            content=content,
+            usage=self._build_usage(messages, content),
+            model=_resolve_response_model(data) or self.config.model,
+            raw_response=data,
+        )
 
 
 class GoogleProvider(AIProvider):
@@ -269,7 +320,12 @@ class GoogleProvider(AIProvider):
             response.raise_for_status()
             data = await response.json()
         content = data["candidates"][0]["content"]["parts"][0]["text"]
-        return AIResponse(content=content, usage=self._build_usage(messages, content), raw_response=data)
+        return AIResponse(
+            content=content,
+            usage=self._build_usage(messages, content),
+            model=_resolve_response_model(data) or self.config.model,
+            raw_response=data,
+        )
 
 
 def create_provider(

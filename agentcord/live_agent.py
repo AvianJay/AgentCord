@@ -334,10 +334,10 @@ class AgentConversationSession:
         )
         lines = [
             f"-# {self.context_state.model or self.task_record.model or '(未設定)'}",
-            f"-# 上下文：{context_text}",
-            f"-# 壓縮次數：{self.context_state.compression_count}",
-            f"-# 歷史訊息：{self.context_state.history_messages}",
-            f"-# 階段：{self.context_state.phase}",
+            f"-# {context_text} | {self.context_state.phase}",
+            # f"-# 壓縮次數：{self.context_state.compression_count}",
+            # f"-# 歷史訊息：{self.context_state.history_messages}",
+            # f"-# 階段：{self.context_state.phase}",
         ]
         return "\n".join(lines)
 
