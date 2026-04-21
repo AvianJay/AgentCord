@@ -25,6 +25,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "model": "模型",
     "provider": "供應商",
     "api_key": "金鑰",
+    "archive": "壓縮檔",
     "path": "路徑",
     "content": "內容",
     "task_id": "任務編號",
@@ -512,6 +513,32 @@ def register_commands(bot: AgentCordBot) -> None:
         )
         await interaction.followup.send("工作區匯出已準備完成。", file=file, ephemeral=True)
 
+    @bot.tree.command(name="import-zip", description="從 zip 壓縮檔匯入工作區。")
+    @app_commands.describe(archive="要匯入到工作區根目錄的 zip 壓縮檔。")
+    async def import_zip(interaction: discord.Interaction, archive: discord.Attachment) -> None:
+        if not archive.filename.lower().endswith(".zip"):
+            raise ValueError("請上傳副檔名為 .zip 的壓縮檔。")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        archive_bytes = await archive.read()
+        imported_paths = bot.workspace.import_zip(interaction.user.id, archive_bytes)
+        total_size = bot.workspace.total_size(interaction.user.id)
+        preview_paths = ", ".join(imported_paths[:5])
+        if len(imported_paths) > 5:
+            preview_paths += f" 等 {len(imported_paths)} 個檔案"
+        await log_interaction(
+            interaction,
+            "匯入工作區 zip。",
+            fields=[
+                ("檔名", archive.filename, True),
+                ("檔案數", str(len(imported_paths)), True),
+                ("預覽", preview_text(preview_paths or "(空白)", 900), False),
+            ],
+        )
+        await interaction.followup.send(
+            f"已匯入 {len(imported_paths)} 個檔案。工作區用量：{total_size}/{bot.settings.workspace_limit_bytes} 位元組。",
+            ephemeral=True,
+        )
+
     @bot.command(name="add_credits")
     async def add_credits(ctx: commands.Context[AgentCordBot], member: discord.User, amount: float) -> None:
         if bot.settings.bot_owner_id is not None and ctx.author.id != bot.settings.bot_owner_id:
@@ -555,6 +582,7 @@ def register_commands(bot: AgentCordBot) -> None:
     @file_delete.error
     @file_mkdir.error
     @export_zip.error
+    @import_zip.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         original = getattr(error, "original", error)
         message = str(original)

@@ -17,7 +17,7 @@ AI-powered coding agent bot for Discord, built with `discord.py`.
 - Task tracking for agent runs
 - Markdown memory notes stored in the workspace
 - Guarded web search/fetch flow using Pollinations `gemini-search`
-- Zip export for generated projects
+- Zip export and import for workspace projects
 
 ## Requirements
 
@@ -53,4 +53,5 @@ python main.py
 - Users cannot execute code; the bot only generates and edits files.
 - Python validation uses syntax-only compilation via `py_compile`.
 - Existing file edits are designed to prefer unified diff patches over full overwrites during agent runs.
+- `/import-zip` only accepts valid zip archives containing UTF-8 text files and rejects path traversal entries.
 - When `DISCORD_LOG_WEBHOOK` is set, command usage, agent session actions, and execution errors are queued and sent to the webhook in embed batches.

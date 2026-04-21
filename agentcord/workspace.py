@@ -93,6 +93,57 @@ class WorkspaceManager:
                     archive.write(file_path, arcname=file_path.relative_to(root))
         return target
 
+    def import_zip(self, user_id: int, archive_bytes: bytes) -> list[str]:
+        try:
+            archive_buffer = io.BytesIO(archive_bytes)
+            with zipfile.ZipFile(archive_buffer) as archive:
+                file_members = [member for member in archive.infolist() if not member.is_dir()]
+                if not file_members:
+                    raise WorkspaceError("Zip 壓縮檔中沒有可匯入的檔案。")
+
+                normalized_members: list[tuple[str, zipfile.ZipInfo]] = []
+                seen_paths: set[str] = set()
+                total_size = 0
+                for member in file_members:
+                    normalized_path = self._normalize_relative_path(member.filename)
+                    if normalized_path == ".":
+                        continue
+                    if normalized_path in seen_paths:
+                        raise WorkspaceError(f"Zip 壓縮檔包含重複路徑：{normalized_path}")
+                    seen_paths.add(normalized_path)
+                    total_size += member.file_size
+                    normalized_members.append((normalized_path, member))
+
+                if not normalized_members:
+                    raise WorkspaceError("Zip 壓縮檔中沒有可匯入的檔案。")
+
+                existing_total = self.total_size(user_id)
+                existing_sizes: dict[str, int] = {}
+                for normalized_path, _ in normalized_members:
+                    absolute = self._resolve_path(user_id, normalized_path)
+                    existing_sizes[normalized_path] = absolute.stat().st_size if absolute.exists() else 0
+                projected_total = existing_total - sum(existing_sizes.values()) + total_size
+                if projected_total > self._limit_bytes:
+                    raise WorkspaceError(
+                        f"匯入遭拒：工作區將超過 {self._limit_bytes} 位元組上限。"
+                    )
+
+                imported_paths: list[str] = []
+                for normalized_path, member in normalized_members:
+                    absolute = self._resolve_path(user_id, normalized_path)
+                    absolute.parent.mkdir(parents=True, exist_ok=True)
+                    extracted = archive.read(member)
+                    try:
+                        text_content = extracted.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise WorkspaceError(f"只允許匯入 UTF-8 文字檔：{normalized_path}") from exc
+                    self._assert_text(text_content)
+                    absolute.write_bytes(extracted)
+                    imported_paths.append(normalized_path)
+                return imported_paths
+        except zipfile.BadZipFile as exc:
+            raise WorkspaceError("上傳的檔案不是有效的 zip 壓縮檔。") from exc
+
     def py_compile_check(self, user_id: int, path: str) -> str:
         absolute = self._resolve_path(user_id, path)
         if absolute.suffix != ".py":
