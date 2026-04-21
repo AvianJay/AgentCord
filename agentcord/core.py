@@ -213,8 +213,8 @@ class SearchAllowlist:
 
 
 def html_to_markdown(html: str) -> str:
-    text = re.sub(r"<script[\\s\\S]*?</script>", "", html, flags=re.IGNORECASE)
-    text = re.sub(r"<style[\\s\\S]*?</style>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
+    text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.IGNORECASE)
     replacements = {
         r"</h[1-6]>": "\n\n",
         r"<h1[^>]*>": "# ",
@@ -222,7 +222,7 @@ def html_to_markdown(html: str) -> str:
         r"<h3[^>]*>": "### ",
         r"</p>": "\n\n",
         r"<p[^>]*>": "",
-        r"<br\\s*/?>": "\n",
+        r"<br\s*/?>": "\n",
         r"<li[^>]*>": "- ",
         r"</li>": "\n",
     }
