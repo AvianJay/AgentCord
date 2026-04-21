@@ -16,7 +16,7 @@ AI-powered coding agent bot for Discord, built with `discord.py`.
 - External providers for OpenAI, Anthropic, Google, xAI, and OpenAI-compatible custom endpoints
 - Task tracking for agent runs
 - Markdown memory notes stored in the workspace
-- Guarded web search/fetch flow using Pollinations `gemini-search`
+- Web search via Pollinations `gemini-search` and direct webpage fetching through optional `PROXY_*` settings
 - Zip export and import for workspace projects
 
 ## Requirements
@@ -38,6 +38,10 @@ Environment variables:
 - `DISCORD_LOG_WEBHOOK` (optional, sends batched webhook embeds for command and agent activity logs)
 - `POLLINATIONS_API_KEY` (optional, used for Pollinations and search)
 - `AGENTCORD_CUSTOM_PROVIDER_BASE_URL` (required when provider is `custom`)
+- `PROXY_URL` (optional, used by agent `fetch_url` for proxied webpage fetching)
+- `PROXY_USERNAME` / `PROXY_PASSWORD` (optional, proxy credentials for `fetch_url`)
+- `PROXY_HOST` / `PROXY_PORT` / `PROXY_SCHEME` (optional fallback to build `PROXY_URL`)
+- `PROXY_HEADERS_JSON` (optional JSON object for proxy request headers)
 - `AGENTCORD_DATA_DIR` (defaults to `./data`)
 - `AGENTCORD_DEFAULT_MODEL` (defaults to `openai`)
 - `AGENTCORD_MODEL_RATES_JSON` (optional JSON override for credit rates)

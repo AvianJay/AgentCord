@@ -605,11 +605,28 @@ class CodingAgent:
         return data
 
     async def _fetch_url(self, user_id: int, url: str) -> str:
-        if not self.db.is_allowed_url(user_id, url):
-            raise ValueError("fetch_url 只能存取由 search_web 回傳的 URL。")
-        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as response:
+        request_kwargs = self._build_proxy_request_kwargs()
+        async with self.session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=45),
+            allow_redirects=True,
+            **request_kwargs,
+        ) as response:
             response.raise_for_status()
             return await response.text()
+
+    def _build_proxy_request_kwargs(self) -> dict[str, Any]:
+        if not self.settings.proxy_url:
+            return {}
+        request_kwargs: dict[str, Any] = {"proxy": self.settings.proxy_url}
+        if self.settings.proxy_username:
+            request_kwargs["proxy_auth"] = aiohttp.BasicAuth(
+                self.settings.proxy_username,
+                self.settings.proxy_password,
+            )
+        if self.settings.proxy_headers:
+            request_kwargs["proxy_headers"] = self.settings.proxy_headers
+        return request_kwargs
 
 
 _PLANNING_SYSTEM_PROMPT = """
@@ -635,6 +652,7 @@ _AGENT_SYSTEM_PROMPT = """
 - 只可寫入 UTF-8 文字檔。
 - 只回傳合法 JSON。
 - summary 與 plan 內容請使用繁體中文。
+- fetch_url 可直接抓取公開網址內容；若設定了 PROXY_* 環境變數，會透過 proxy 抓取，不需要先經過 search_web。
 - 如果目前工作有明確步驟，請使用 tasks 工具更新工作清單，好讓使用者看到目前進度。
 - JSON schema:
   {

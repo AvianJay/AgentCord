@@ -32,10 +32,15 @@ class Settings:
     default_pollinations_model: str
     pollinations_api_key: str
     custom_provider_base_url: str
+    proxy_url: str
+    proxy_username: str
+    proxy_password: str
     agent_max_iterations: int
     agent_max_actions_per_iteration: int
     credit_reserve_output_tokens: int
     model_rates: dict[str, float] = field(default_factory=dict)
+    proxy_headers: dict[str, str] = field(default_factory=dict)
+    proxy_env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -43,6 +48,32 @@ class Settings:
         raw_rates = os.getenv("AGENTCORD_MODEL_RATES_JSON", "").strip()
         if raw_rates:
             rates.update(json.loads(raw_rates))
+
+        proxy_env = {
+            key: value.strip()
+            for key, value in os.environ.items()
+            if key.startswith("PROXY") and value.strip()
+        }
+        proxy_headers: dict[str, str] = {}
+        raw_proxy_headers = proxy_env.get("PROXY_HEADERS_JSON", "")
+        if raw_proxy_headers:
+            parsed_headers = json.loads(raw_proxy_headers)
+            if not isinstance(parsed_headers, dict):
+                raise ValueError("PROXY_HEADERS_JSON 必須是 JSON 物件。")
+            proxy_headers = {
+                str(key): str(value)
+                for key, value in parsed_headers.items()
+            }
+
+        proxy_url = proxy_env.get("PROXY_URL", "").strip()
+        if not proxy_url:
+            proxy_host = proxy_env.get("PROXY_HOST", "").strip()
+            if proxy_host:
+                proxy_scheme = proxy_env.get("PROXY_SCHEME", "http").strip() or "http"
+                proxy_port = proxy_env.get("PROXY_PORT", "").strip()
+                proxy_url = f"{proxy_scheme}://{proxy_host}"
+                if proxy_port:
+                    proxy_url = f"{proxy_url}:{proxy_port}"
 
         return cls(
             discord_token=os.getenv("DISCORD_TOKEN", "").strip(),
@@ -55,10 +86,15 @@ class Settings:
             default_pollinations_model=os.getenv("AGENTCORD_DEFAULT_MODEL", "openai").strip() or "openai",
             pollinations_api_key=os.getenv("POLLINATIONS_API_KEY", "").strip(),
             custom_provider_base_url=os.getenv("AGENTCORD_CUSTOM_PROVIDER_BASE_URL", "").strip(),
+            proxy_url=proxy_url,
+            proxy_username=proxy_env.get("PROXY_USERNAME", proxy_env.get("PROXY_USER", "")).strip(),
+            proxy_password=proxy_env.get("PROXY_PASSWORD", proxy_env.get("PROXY_PASS", "")).strip(),
             agent_max_iterations=max(1, int(os.getenv("AGENTCORD_AGENT_MAX_ITERATIONS", "6"))),
             agent_max_actions_per_iteration=max(1, int(os.getenv("AGENTCORD_AGENT_MAX_ACTIONS", "8"))),
             credit_reserve_output_tokens=max(128, int(os.getenv("AGENTCORD_CREDIT_RESERVE_OUTPUT_TOKENS", "1024"))),
             model_rates=rates,
+            proxy_headers=proxy_headers,
+            proxy_env=proxy_env,
         )
 
     def get_model_rate(self, provider: Provider, model: str) -> float:
