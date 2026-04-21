@@ -14,6 +14,15 @@ _POLLINATIONS_MODELS_CACHE_TTL = 900.0
 _pollinations_models_cache: tuple[float, list[PollinationsModelInfo], dict[str, PollinationsModelInfo]] | None = None
 
 
+def _request_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(total=180, connect=30, sock_connect=30, sock_read=180)
+
+
+def _stream_timeout() -> aiohttp.ClientTimeout:
+    # Streaming responses can legitimately take several minutes; only fail when the socket stalls.
+    return aiohttp.ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=300)
+
+
 class AIProvider(ABC):
     def __init__(self, session: aiohttp.ClientSession, settings: Settings, config: UserModelConfig) -> None:
         self.session = session
@@ -64,7 +73,7 @@ class PollinationsProvider(AIProvider):
             "https://gen.pollinations.ai/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=90),
+            timeout=_request_timeout(),
         ) as response:
             response.raise_for_status()
             data = await response.json()
@@ -90,7 +99,7 @@ class PollinationsProvider(AIProvider):
             "https://gen.pollinations.ai/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=90),
+            timeout=_stream_timeout(),
         ) as response:
             response.raise_for_status()
             if response.content_type == "application/json":
@@ -152,7 +161,7 @@ class OpenAICompatibleProvider(AIProvider):
             f"{self.base_url}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=90),
+            timeout=_request_timeout(),
         ) as response:
             response.raise_for_status()
             data = await response.json()
@@ -179,7 +188,7 @@ class OpenAICompatibleProvider(AIProvider):
             f"{self.base_url}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=90),
+            timeout=_stream_timeout(),
         ) as response:
             response.raise_for_status()
             if response.content_type == "application/json":
@@ -238,7 +247,7 @@ class AnthropicProvider(AIProvider):
             "https://api.anthropic.com/v1/messages",
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=90),
+            timeout=_request_timeout(),
         ) as response:
             response.raise_for_status()
             data = await response.json()
@@ -255,7 +264,7 @@ class GoogleProvider(AIProvider):
         async with self.session.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{self.config.model}:generateContent?key={self.config.api_key}",
             json={"contents": parts},
-            timeout=aiohttp.ClientTimeout(total=90),
+            timeout=_request_timeout(),
         ) as response:
             response.raise_for_status()
             data = await response.json()
