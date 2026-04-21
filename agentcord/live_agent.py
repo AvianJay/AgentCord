@@ -412,27 +412,22 @@ class AgentConversationView(discord.ui.LayoutView):
         self._tasks_display = discord.ui.TextDisplay("## 待辦事項\n(無)")
         self._context_display = discord.ui.TextDisplay("-# (未設定)")
         self._operations_display = discord.ui.TextDisplay("-# #0")
+        self._after_activity_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
+        self._after_tasks_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
+        self._after_context_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._interrupt_button = discord.ui.Button(label="中斷", style=discord.ButtonStyle.danger)
         self._interrupt_button.callback = self._on_interrupt
         self._send_message_button = discord.ui.Button(label="傳送訊息", style=discord.ButtonStyle.primary)
         self._send_message_button.callback = self._on_send_message
         self._refresh_button = discord.ui.Button(label="重新整理", style=discord.ButtonStyle.secondary)
         self._refresh_button.callback = self._on_refresh
-        self._container = discord.ui.Container(accent_colour=discord.Colour.blurple())
-        self._container.add_item(self._activity_display)
-        self._container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
-        self._container.add_item(self._tasks_display)
-        self._container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
-        self._container.add_item(self._context_display)
-        self._container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
-        self._container.add_item(self._operations_display)
-        self._container.add_item(
-            discord.ui.ActionRow(
-                self._interrupt_button,
-                self._send_message_button,
-                self._refresh_button,
-            )
+        self._actions_row = discord.ui.ActionRow(
+            self._interrupt_button,
+            self._send_message_button,
+            self._refresh_button,
         )
+        self._container = discord.ui.Container(accent_colour=discord.Colour.blurple())
+        self._rebuild_container()
         self.add_item(self._container)
 
     async def _on_interrupt(self, interaction: discord.Interaction) -> None:
@@ -466,12 +461,25 @@ class AgentConversationView(discord.ui.LayoutView):
             return
         self._interrupt_button.disabled = not self.session.is_busy()
 
+    def _rebuild_container(self) -> None:
+        self._container.clear_items()
+        self._container.add_item(self._activity_display)
+        self._container.add_item(self._after_activity_separator)
+        if self.session.task_items:
+            self._container.add_item(self._tasks_display)
+            self._container.add_item(self._after_tasks_separator)
+        self._container.add_item(self._context_display)
+        self._container.add_item(self._after_context_separator)
+        self._container.add_item(self._operations_display)
+        self._container.add_item(self._actions_row)
+
     def sync_layout(self) -> None:
         self._activity_display.content = self.session._render_activity_display()
         self._tasks_display.content = self.session._render_tasks_block()
         self._context_display.content = self.session._render_context_block()
         self._operations_display.content = self.session._render_operations_block()
         self.sync_buttons()
+        self._rebuild_container()
 
 
 class AgentMessageModal(discord.ui.Modal):
