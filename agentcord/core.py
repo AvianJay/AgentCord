@@ -26,8 +26,9 @@ class UserWorkspace:
         rel = Path(relative_path)
         if rel.is_absolute():
             raise WorkspaceError("Only relative paths are allowed.")
-        candidate = (self.root / rel).resolve()
-        if self.root.resolve() not in candidate.parents and candidate != self.root.resolve():
+        root = self.root.resolve()
+        candidate = (root / rel).resolve()
+        if not candidate.is_relative_to(root):
             raise WorkspaceError("Path traversal is not allowed.")
         return candidate
 
@@ -214,8 +215,8 @@ class SearchAllowlist:
 
 
 def html_to_markdown(html: str) -> str:
-    text = re.sub(r"<script\b[\s\S]*?</script\s*>", "", html, flags=re.IGNORECASE)
-    text = re.sub(r"<style\b[\s\S]*?</style\s*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<script\b[\s\S]*?</script[^>]*>", "", html, flags=re.IGNORECASE)
+    text = re.sub(r"<style\b[\s\S]*?</style[^>]*>", "", text, flags=re.IGNORECASE)
     replacements = {
         r"</h[1-6]>": "\n\n",
         r"<h1[^>]*>": "# ",
