@@ -164,7 +164,16 @@ class CodingAgent:
                     results.append({"tool": tool_name, "path": action["path"], "result": "ok"})
                 elif tool_name == "list_files":
                     entries = self.workspace.list_files(user_id, action.get("path", "."))
-                    results.append({"tool": tool_name, "path": action.get("path", "."), "result": [entry.__dict__ for entry in entries]})
+                    results.append(
+                        {
+                            "tool": tool_name,
+                            "path": action.get("path", "."),
+                            "result": [
+                                {"path": entry.path, "kind": entry.kind, "size": entry.size}
+                                for entry in entries
+                            ],
+                        }
+                    )
                 elif tool_name == "delete_file":
                     self.workspace.delete_file(user_id, action["path"])
                     touched_files.append(action["path"])
