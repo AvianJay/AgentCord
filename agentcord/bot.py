@@ -85,7 +85,8 @@ class AgentCordBot(commands.Bot):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents, application_id=settings.discord_application_id)
+        allowed_mentions = discord.AllowedMentions.none()
+        super().__init__(command_prefix="!", intents=intents, application_id=settings.discord_application_id, allowed_mentions=allowed_mentions)
         self.settings = settings
         self.db = Database(settings.data_dir / "agentcord.db", settings.default_credits)
         self.workspace = WorkspaceManager(settings.data_dir / "workspaces", settings.workspace_limit_bytes)
