@@ -18,6 +18,8 @@ class TaskStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     DONE = "done"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 @dataclass(slots=True)
@@ -25,6 +27,18 @@ class UserModelConfig:
     provider: Provider = Provider.POLLINATIONS
     model: str = "openai"
     api_key: str = ""
+
+
+@dataclass(slots=True)
+class ConversationMessage:
+    role: str
+    content: str
+
+
+@dataclass(slots=True)
+class AgentTaskItem:
+    title: str
+    status: str = "pending"
 
 
 @dataclass(slots=True)
@@ -43,11 +57,32 @@ class AIResponse:
 
 
 @dataclass(slots=True)
+class PollinationsModelInfo:
+    name: str
+    aliases: list[str] = field(default_factory=list)
+    description: str = ""
+    context_length: int | None = None
+    paid_only: bool = False
+    tools: bool = False
+
+
+@dataclass(slots=True)
 class TaskRecord:
     id: int
+    user_id: int
     title: str
     status: TaskStatus
     related_files: list[str]
+    summary: str = ""
+    plan: list[str] = field(default_factory=list)
+    validations: list[str] = field(default_factory=list)
+    messages: list[ConversationMessage] = field(default_factory=list)
+    task_items: list[AgentTaskItem] = field(default_factory=list)
+    model: str = ""
+    context_length: int | None = None
+    compression_count: int = 0
+    created_at: int = 0
+    updated_at: int = 0
 
 
 def estimate_tokens(text: str) -> int:

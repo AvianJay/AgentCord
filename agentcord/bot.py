@@ -10,10 +10,11 @@ from discord import app_commands
 from discord.ext import commands
 
 from agentcord.agent import CodingAgent, CreditManager
-from agentcord.ai import create_provider
+from agentcord.ai import create_provider, fetch_pollinations_models, resolve_pollinations_model
 from agentcord.config import Settings
 from agentcord.database import Database
-from agentcord.models import Provider, UserModelConfig
+from agentcord.live_agent import AgentConversationSession
+from agentcord.models import Provider, TaskRecord, TaskStatus, UserModelConfig
 from agentcord.workspace import WorkspaceError, WorkspaceManager
 
 
@@ -24,6 +25,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "api_key": "金鑰",
     "path": "路徑",
     "content": "內容",
+    "task_id": "任務編號",
 }
 
 
@@ -72,6 +74,7 @@ class AgentCordBot(commands.Bot):
         self.http_session: aiohttp.ClientSession | None = None
         self.credits = CreditManager(self.db, settings)
         self.agent: CodingAgent | None = None
+        self.agent_sessions: dict[int, AgentConversationSession] = {}
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
@@ -81,6 +84,9 @@ class AgentCordBot(commands.Bot):
         await self.tree.sync()
 
     async def close(self) -> None:
+        for session in list(self.agent_sessions.values()):
+            await session.close("Bot 正在關閉，這個對話已停止更新。")
+        self.agent_sessions.clear()
         if self.http_session is not None:
             await self.http_session.close()
         self.db.close()
@@ -88,6 +94,65 @@ class AgentCordBot(commands.Bot):
 
 
 def register_commands(bot: AgentCordBot) -> None:
+    async def close_replaceable_session(user_id: int) -> None:
+        existing_session = bot.agent_sessions.get(user_id)
+        if existing_session is None:
+            return
+        if existing_session.is_busy():
+            raise ValueError("你已經有一個 agent 對話正在執行，請先等待完成或按下中斷。")
+        await existing_session.close("這個對話已被新的 agent 會話取代。")
+        if bot.agent_sessions.get(user_id) is existing_session:
+            bot.agent_sessions.pop(user_id, None)
+
+    async def open_agent_session(
+        interaction: discord.Interaction,
+        task: TaskRecord,
+        *,
+        reopened: bool = False,
+    ) -> AgentConversationSession:
+        await close_replaceable_session(interaction.user.id)
+        session = AgentConversationSession(bot, interaction.user, task)
+        bot.agent_sessions[interaction.user.id] = session
+        await session.open(interaction, reopened=reopened)
+        return session
+
+    async def start_new_agent_session(
+        interaction: discord.Interaction,
+        prompt: str,
+    ) -> AgentConversationSession:
+        await close_replaceable_session(interaction.user.id)
+        task = bot.db.create_task(interaction.user.id, title=prompt[:120], status=TaskStatus.PENDING)
+        session = AgentConversationSession(bot, interaction.user, task)
+        bot.agent_sessions[interaction.user.id] = session
+        await session.open(interaction)
+        return session
+
+    def format_task_status(status: TaskStatus) -> str:
+        if status is TaskStatus.DONE:
+            return "完成"
+        if status is TaskStatus.RUNNING:
+            return "執行中"
+        if status is TaskStatus.CANCELLED:
+            return "已中斷"
+        if status is TaskStatus.FAILED:
+            return "失敗"
+        return "待命"
+
+    def format_model_choice_name(model_name: str, context_length: int | None, description: str) -> str:
+        context_text = f"{context_length:,} ctx" if context_length else "ctx ?"
+        label = f"{model_name} | {context_text}"
+        if description:
+            label = f"{label} | {description}"
+        if len(label) > 100:
+            return label[:97] + "..."
+        return label
+
+    def is_public_agent_command(interaction: discord.Interaction) -> bool:
+        command = interaction.command
+        if command is None:
+            return False
+        return command.name in {"agent", "call-ai-codeing", "agent-history", "agent-open"}
+
     @bot.tree.command(name="ask", description="向目前設定的 AI 模型提問。")
     @app_commands.describe(prompt="輸入要交給 AI 助手的提示內容。")
     async def ask(interaction: discord.Interaction, prompt: str) -> None:
@@ -125,31 +190,89 @@ def register_commands(bot: AgentCordBot) -> None:
     @app_commands.describe(prompt="描述要讓代理建立或修改的內容。")
     async def agent_command(interaction: discord.Interaction, prompt: str) -> None:
         assert bot.agent is not None
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await bot.agent.run(interaction.user.id, prompt)
-        message = (
-            f"任務 #{result.task_id} 已完成。\n"
-            f"計畫：\n- " + "\n- ".join(result.plan) + "\n\n"
-            f"摘要：\n{result.summary}\n\n"
-            f"相關檔案：{', '.join(result.related_files) if result.related_files else '無'}\n"
-            f"驗證：\n- " + ("\n- ".join(result.validations) if result.validations else "沒有驗證任何 Python 檔案。")
-        )
-        for chunk in chunk_text(message):
-            await interaction.followup.send(chunk, ephemeral=True)
+        session = await start_new_agent_session(interaction, prompt)
+        await session.enqueue_prompt(prompt)
 
     @bot.tree.command(name="call-ai-codeing", description="/agent 的別名。")
     @app_commands.describe(prompt="描述要讓代理建立或修改的內容。")
     async def agent_alias(interaction: discord.Interaction, prompt: str) -> None:
-        await agent_command.callback(interaction, prompt)  # type: ignore[attr-defined]
+        session = await start_new_agent_session(interaction, prompt)
+        await session.enqueue_prompt(prompt)
+
+    @bot.tree.command(name="agent-history", description="查看最近 20 筆 agent 對話。")
+    async def agent_history(interaction: discord.Interaction) -> None:
+        tasks = bot.db.list_tasks(interaction.user.id, limit=20)
+        if not tasks:
+            await interaction.response.send_message("目前沒有任何 agent 對話歷史。")
+            return
+        lines = ["最近 20 筆 agent 對話："]
+        for task in tasks:
+            timestamp = f"<t:{task.updated_at}:R>" if task.updated_at else "時間未知"
+            model_name = task.model or bot.db.get_model_config(interaction.user.id, bot.settings.default_pollinations_model).model
+            lines.append(
+                f"#{task.id} [{format_task_status(task.status)}] {task.title} | {model_name} | {timestamp}"
+            )
+        lines.append("使用 /agent-open 並帶入 task_id 可重新打開對話。")
+        message = "\n".join(lines)
+        for index, chunk in enumerate(chunk_text(message)):
+            if index == 0:
+                await interaction.response.send_message(chunk)
+            else:
+                await interaction.followup.send(chunk)
+
+    @bot.tree.command(name="agent-open", description="重新打開既有的 agent 對話。")
+    @app_commands.describe(task_id="要重新打開的對話編號。", prompt="可選：重新打開後立刻送出的新訊息。")
+    async def agent_open(interaction: discord.Interaction, task_id: int, prompt: str | None = None) -> None:
+        task = bot.db.get_task(interaction.user.id, task_id)
+        session = await open_agent_session(interaction, task, reopened=True)
+        if prompt and prompt.strip():
+            await session.enqueue_prompt(prompt)
 
     @bot.tree.command(name="set-model", description="設定你的 Pollinations 模型。")
     @app_commands.describe(model="設定 /ask 與 /agent 使用的 Pollinations 模型。")
     async def set_model(interaction: discord.Interaction, model: str) -> None:
+        assert bot.http_session is not None
+        model_info = await resolve_pollinations_model(bot.http_session, bot.settings, model)
+        if model_info is None:
+            raise ValueError(f"找不到 Pollinations 模型：{model}")
+        if model_info.paid_only:
+            raise ValueError("/set-model 只允許選擇免費模型。")
         config = UserModelConfig(provider=Provider.POLLINATIONS, model=model, api_key=bot.settings.pollinations_api_key)
         bot.db.set_model_config(interaction.user.id, config)
         await interaction.response.send_message(
             f"模型已設定為 Pollinations/{model}。", ephemeral=True
         )
+
+    @set_model.autocomplete("model")
+    async def set_model_autocomplete(
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        assert bot.http_session is not None
+        models = await fetch_pollinations_models(bot.http_session, bot.settings)
+        current_lower = current.lower().strip()
+        filtered = [
+            model_info
+            for model_info in models
+            if not model_info.paid_only
+            and (
+                not current_lower
+                or current_lower in model_info.name.lower()
+                or current_lower in model_info.description.lower()
+                or any(current_lower in alias.lower() for alias in model_info.aliases)
+            )
+        ]
+        return [
+            app_commands.Choice(
+                name=format_model_choice_name(
+                    model_info.name,
+                    model_info.context_length,
+                    model_info.description,
+                ),
+                value=model_info.name,
+            )
+            for model_info in filtered[:25]
+        ]
 
     @bot.tree.command(name="custom-model", description="設定非 Pollinations 的模型供應商。")
     @app_commands.describe(provider="供應商類型：openai / anthropic / google / xai / custom", api_key="供應商 API 金鑰。", model="供應商模型名稱。")
@@ -231,6 +354,8 @@ def register_commands(bot: AgentCordBot) -> None:
     @ask.error
     @agent_command.error
     @agent_alias.error
+    @agent_history.error
+    @agent_open.error
     @set_model.error
     @custom_model.error
     @file_list.error
@@ -245,10 +370,11 @@ def register_commands(bot: AgentCordBot) -> None:
         if isinstance(original, (WorkspaceError, ValueError, aiohttp.ClientError)):
             if isinstance(original, aiohttp.ClientError):
                 message = f"網路請求失敗：{message or type(original).__name__}"
+            use_ephemeral = not is_public_agent_command(interaction)
             if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
+                await interaction.followup.send(message, ephemeral=use_ephemeral)
             else:
-                await interaction.response.send_message(message, ephemeral=True)
+                await interaction.response.send_message(message, ephemeral=use_ephemeral)
             return
         raise error
 
