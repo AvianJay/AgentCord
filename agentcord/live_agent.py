@@ -455,7 +455,15 @@ class AgentConversationView(discord.ui.LayoutView):
         await interaction.response.defer()
         await self.session.request_render(force=True)
 
+    def disable_all_items(self) -> None:
+        self._interrupt_button.disabled = True
+        self._send_message_button.disabled = True
+        self._refresh_button.disabled = True
+
     def sync_buttons(self) -> None:
+        if self.session._closed:
+            self.disable_all_items()
+            return
         self._interrupt_button.disabled = not self.session.is_busy()
 
     def sync_layout(self) -> None:
