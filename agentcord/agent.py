@@ -958,6 +958,12 @@ class CodingAgent:
             spec = self._tool_specs.get(tool_name)
             if spec is None:
                 results.append({"tool": tool_name or "(unknown)", "error": "不支援的工具。"})
+                await self._emit_tool_result_preview(
+                    progress_callback,
+                    tool_name or "(unknown)",
+                    status="error",
+                    preview="不支援的工具。",
+                )
                 await self._emit_activity(
                     progress_callback,
                     f"工具 {tool_name or '(unknown)'} 失敗：不支援的工具。",
@@ -974,8 +980,20 @@ class CodingAgent:
                 )
                 touched_files.extend(tool_touched_files)
                 results.append({"tool": tool_name, **result_payload})
+                await self._emit_tool_result_preview(
+                    progress_callback,
+                    tool_name,
+                    status="ok",
+                    preview=self._preview_tool_result_payload(result_payload),
+                )
             except (WorkspaceError, KeyError, ValueError, aiohttp.ClientError) as exc:
                 results.append({"tool": tool_name, "error": str(exc)})
+                await self._emit_tool_result_preview(
+                    progress_callback,
+                    tool_name,
+                    status="error",
+                    preview=str(exc),
+                )
                 await self._emit_activity(
                     progress_callback,
                     f"{self._format_tool_label(tool_name)}失敗：{exc}",
@@ -1991,6 +2009,33 @@ class CodingAgent:
         maybe_result = progress_callback(event)
         if maybe_result is not None:
             await maybe_result
+
+    async def _emit_tool_result_preview(
+        self,
+        progress_callback: ProgressCallback | None,
+        tool_name: str,
+        *,
+        status: str,
+        preview: str,
+    ) -> None:
+        await self._emit_progress(
+            progress_callback,
+            {
+                "type": "tool_result",
+                "tool": tool_name,
+                "status": status,
+                "preview": preview,
+            },
+        )
+
+    def _preview_tool_result_payload(self, payload: dict[str, Any], limit: int = 800) -> str:
+        try:
+            text = json.dumps(payload, ensure_ascii=False)
+        except TypeError:
+            text = str(payload)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
 
     def _build_stream_progress_callback(
         self,

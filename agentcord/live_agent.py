@@ -84,6 +84,7 @@ class AgentConversationSession:
             history_messages=len(task.messages),
         )
         self.message: discord.Message | None = None
+        self._pending_file_changes: list[dict[str, Any]] = []
         self.view = AgentConversationView(self)
         self._activity_lines: deque[ActivityEntry] = deque()
         self._prompt_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -94,7 +95,6 @@ class AgentConversationSession:
         self._closed = False
         self._run_sequence = 0
         self._active_run_scope: str | None = None
-        self._pending_file_changes: list[dict[str, Any]] = []
         self._refresh_pending_file_changes()
         if task.summary:
             self._append_activity(f"目前摘要：{task.summary}")
@@ -105,6 +105,79 @@ class AgentConversationSession:
 
     def is_busy(self) -> bool:
         return (self._current_run_task is not None and not self._current_run_task.done()) or not self._prompt_queue.empty()
+
+    def _ensure_worker_running(self) -> bool:
+        if self._closed or self._prompt_queue.empty():
+            return False
+        if self._worker_task is not None and not self._worker_task.done():
+            return False
+        self._worker_task = asyncio.create_task(self._worker_loop())
+        return True
+
+    async def _safe_log_event(
+        self,
+        title: str,
+        description: str,
+        *,
+        color: discord.Colour | None = None,
+        fields: list[tuple[str, str, bool]] | None = None,
+    ) -> None:
+        try:
+            await self.bot.log_event(
+                title,
+                description,
+                user=self.user,
+                guild=self.guild,
+                color=color,
+                fields=fields,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[AgentCord UI] log_event 失敗: {exc}")
+
+    async def _safe_log_exception(
+        self,
+        title: str,
+        error: BaseException,
+        *,
+        details: str = "",
+        fields: list[tuple[str, str, bool]] | None = None,
+    ) -> None:
+        try:
+            await self.bot.log_exception(
+                title,
+                error,
+                user=self.user,
+                guild=self.guild,
+                details=details,
+                fields=fields,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[AgentCord UI] log_exception 失敗: {exc}")
+
+    async def handle_interaction_exception(
+        self,
+        source: str,
+        error: BaseException,
+        interaction: discord.Interaction | None = None,
+        *,
+        details: str = "",
+    ) -> None:
+        interaction_name = type(interaction).__name__ if interaction is not None else "interaction"
+        await self._safe_log_exception(
+            f"{source} 失敗",
+            error,
+            details=(details or "UI interaction 處理失敗。") + f"\nTask ID: {self.task_record.id}\nInteraction: {interaction_name}",
+        )
+        if interaction is None:
+            return
+        message = f"互動處理失敗：{error}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:  # noqa: BLE001
+            return
 
     async def open(self, interaction: discord.Interaction, *, reopened: bool = False) -> None:
         self.guild = interaction.guild
@@ -132,19 +205,19 @@ class AgentConversationSession:
             raise ValueError("訊息不可為空白。")
         if self._closed:
             raise ValueError("這個對話已關閉，請重新開啟新的對話。")
+        was_running = self._current_run_task is not None and not self._current_run_task.done()
         self._append_conversation("user", normalized_prompt)
         await self._prompt_queue.put(normalized_prompt)
-        await self.bot.log_event(
+        self._ensure_worker_running()
+        if was_running:
+            self._append_activity("已將新的使用者訊息加入佇列。")
+        else:
+            self._append_activity("已收到新的使用者訊息，準備執行。", transient=True)
+        await self._safe_log_event(
             "Agent 對話訊息",
             f"送出 agent 對話訊息。\nTask ID: {self.task_record.id}\nPrompt: {self._shorten(' '.join(normalized_prompt.split()), 300)}",
-            user=self.user,
-            guild=self.guild,
         )
-        if self._current_run_task is not None and not self._current_run_task.done():
-            self._append_activity("已將新的使用者訊息加入佇列。")
-        await self.request_render()
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._worker_loop())
+        await self.request_render(force=True)
 
     async def interrupt(self) -> None:
         self._cancel_pending_choice("已取消等待使用者選擇。")
@@ -219,6 +292,18 @@ class AgentConversationSession:
             phase = event.get("phase")
             if isinstance(phase, str):
                 self.context_state.phase = phase
+        elif event_type == "tool_result":
+            tool_name = str(event.get("tool") or "(unknown)")
+            status = str(event.get("status") or "ok")
+            preview = self._shorten(str(event.get("preview") or "(空白)"), 800)
+            await self._safe_log_event(
+                "Agent Tool",
+                f"Task ID: {self.task_record.id}\nTool: {tool_name}\nStatus: {status}\nPreview:\n{preview}",
+                fields=[
+                    ("Tool", tool_name, True),
+                    ("Status", status, True),
+                ],
+            )
         await self.request_render()
         return None
 
@@ -248,10 +333,22 @@ class AgentConversationSession:
         if self.message is None:
             return
         async with self._render_lock:
-            self.view.sync_layout()
             try:
+                self.view.sync_layout()
                 await self.message.edit(content=None, view=self.view)
-            except discord.HTTPException:
+            except discord.HTTPException as exc:
+                await self._safe_log_exception(
+                    "Agent Render 失敗",
+                    exc,
+                    details=f"編輯 agent 訊息失敗。\nTask ID: {self.task_record.id}",
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                await self._safe_log_exception(
+                    "Agent Render 失敗",
+                    exc,
+                    details=f"同步或編輯 agent view 失敗。\nTask ID: {self.task_record.id}",
+                )
                 return
 
     async def _worker_loop(self) -> None:
@@ -788,6 +885,11 @@ class AgentConversationView(discord.ui.LayoutView):
         if interaction.user.id != self.session.user.id:
             await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
+        await self.session._safe_log_event(
+            "Agent 按鈕",
+            f"開啟傳送訊息視窗。\nTask ID: {self.session.task_id}",
+            fields=[("Action", "send-message", True)],
+        )
         await interaction.response.send_modal(AgentMessageModal(self.session))
 
     async def _on_refresh(self, interaction: discord.Interaction) -> None:
@@ -796,6 +898,12 @@ class AgentConversationView(discord.ui.LayoutView):
             return
         await interaction.response.defer()
         self.session._refresh_pending_file_changes()
+        self.session._ensure_worker_running()
+        await self.session._safe_log_event(
+            "Agent 按鈕",
+            f"重新整理 agent 對話畫面。\nTask ID: {self.session.task_id}",
+            fields=[("Action", "refresh", True)],
+        )
         await self.session.request_render(force=True)
 
     async def _on_review_changes(self, interaction: discord.Interaction) -> None:
@@ -808,6 +916,11 @@ class AgentConversationView(discord.ui.LayoutView):
         if not self.session.has_pending_file_changes():
             await interaction.response.send_message("目前沒有待確認變更。", ephemeral=True)
             return
+        await self.session._safe_log_event(
+            "Agent 按鈕",
+            f"開啟待確認變更檢視。\nTask ID: {self.session.task_id}",
+            fields=[("Action", "review", True)],
+        )
         review_view = AgentTaskReviewPopupView(self.session)
         await interaction.response.send_message(review_view.render_message(), ephemeral=True, view=review_view)
 
@@ -827,6 +940,15 @@ class AgentConversationView(discord.ui.LayoutView):
             await interaction.response.send_message("目前不接受自由輸入。", ephemeral=True)
             return
         await interaction.response.send_modal(AgentChoiceFreeformModal(self.session))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        label = getattr(item, "label", None) or getattr(item, "placeholder", None) or type(item).__name__
+        await self.session.handle_interaction_exception(
+            "AgentConversationView",
+            error,
+            interaction,
+            details=f"Item: {label}",
+        )
 
     def disable_all_items(self) -> None:
         self._choice_select.disabled = True
@@ -1015,6 +1137,11 @@ class AgentTaskReviewPopupView(discord.ui.View):
             await interaction.response.edit_message(content="已沒有待確認變更。", view=None)
             return
         current_path = self._paths[self._current_index]
+        await self.session._safe_log_event(
+            "Agent Review",
+            f"回退待確認變更。\nTask ID: {self.session.task_id}\nPath: {current_path}",
+            fields=[("Action", "revert", True), ("Path", current_path, False)],
+        )
         await self.session.revert_pending_file_change(current_path)
         self._sync_paths(preferred_path=current_path)
         self._sync_buttons()
@@ -1033,6 +1160,11 @@ class AgentTaskReviewPopupView(discord.ui.View):
             await interaction.response.edit_message(content="已沒有待確認變更。", view=None)
             return
         current_path = self._paths[self._current_index]
+        await self.session._safe_log_event(
+            "Agent Review",
+            f"接受單一待確認變更。\nTask ID: {self.session.task_id}\nPath: {current_path}",
+            fields=[("Action", "accept", True), ("Path", current_path, False)],
+        )
         await self.session.accept_pending_file_change(current_path)
         self._sync_paths(preferred_path=current_path)
         self._sync_buttons()
@@ -1047,10 +1179,24 @@ class AgentTaskReviewPopupView(discord.ui.View):
         if self.session.is_busy():
             await interaction.response.send_message("請等待目前執行完成後再處理變更。", ephemeral=True)
             return
+        await self.session._safe_log_event(
+            "Agent Review",
+            f"接受全部待確認變更。\nTask ID: {self.session.task_id}",
+            fields=[("Action", "accept-all", True)],
+        )
         accepted = await self.session.accept_all_pending_file_changes()
         self._paths = []
         self._sync_buttons()
         await interaction.response.edit_message(content=f"已接受全部變更，共 {accepted} 個檔案。", view=None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        label = getattr(item, "label", None) or getattr(item, "placeholder", None) or type(item).__name__
+        await self.session.handle_interaction_exception(
+            "AgentTaskReviewPopupView",
+            error,
+            interaction,
+            details=f"Item: {label}",
+        )
 
 
 class AgentTaskReviewFileSelect(discord.ui.Select):
@@ -1127,7 +1273,10 @@ class AgentChoiceFreeformModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        await self.session.submit_freeform(str(self.response_input))
+        await self.session.submit_freeform(str(self.response_input.value or ""))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await self.session.handle_interaction_exception("AgentChoiceFreeformModal", error, interaction)
 
 
 class AgentMessageModal(discord.ui.Modal):
@@ -1144,4 +1293,13 @@ class AgentMessageModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        await self.session.enqueue_prompt(str(self.prompt))
+        prompt_value = str(self.prompt.value or "")
+        await self.session._safe_log_event(
+            "Agent Modal",
+            f"送出傳送訊息 modal。\nTask ID: {self.session.task_id}\nPrompt: {self.session._shorten(' '.join(prompt_value.split()), 300)}",
+            fields=[("Action", "send-message-submit", True)],
+        )
+        await self.session.enqueue_prompt(prompt_value)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await self.session.handle_interaction_exception("AgentMessageModal", error, interaction)
