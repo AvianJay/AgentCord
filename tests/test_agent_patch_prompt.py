@@ -49,6 +49,15 @@ class AgentPatchPromptTests(unittest.TestCase):
         self.assertIn("--- src/controllers/posts.ts", prompt)
         self.assertIn("+++ src/controllers/posts.ts", prompt)
 
+    def test_patch_prompt_includes_local_editing_workflow_rules(self) -> None:
+        prompt = self.agent._build_agent_system_prompt()
+
+        self.assertIn("優先從最具體的錨點開始", prompt)
+        self.assertIn("若使用者已指定檔案，先 read_file 該檔案", prompt)
+        self.assertIn("完成第一次實質修改後，下一步優先做聚焦驗證", prompt)
+        self.assertIn("修改 Python 檔案時，優先使用 py_compile_check 驗證", prompt)
+        self.assertIn("若 apply_patch 因格式錯誤或上下文不符失敗，先重新 read_file", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

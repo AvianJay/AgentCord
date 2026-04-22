@@ -2191,6 +2191,20 @@ apply_patch 的 diff 必須符合下列格式：
 """
 
 
+_EDITING_WORKFLOW_GUIDANCE = """
+編輯與驗證工作流：
+- 優先從最具體的錨點開始：使用者明確提到的檔案、路徑、符號、失敗行為或剛讀過的相鄰檔案。
+- 若使用者已指定檔案，先 read_file 該檔案；不要先做大範圍 list_files 或漫無目的探索。
+- 第一次修改前，只讀取足夠形成單一本地假設與一個便宜驗證檢查的上下文；避免一次讀太多不相關檔案。
+- 編輯既有檔案前，必須以目前最新的 read_file 內容為準產生 diff。
+- 優先做小而局部的修改；不要重排、重命名、格式化或改寫與需求無關的區段。
+- 完成第一次實質修改後，下一步優先做聚焦驗證：先選最便宜且最能否證當前修改的檢查。
+- 修改 Python 檔案時，優先使用 py_compile_check 驗證；修改非 Python 檔案時，至少重新 read_file 檢查結果是否真的落盤。
+- 若 apply_patch 因格式錯誤或上下文不符失敗，先重新 read_file 該檔案後再重試；不要連續盲目送出同類 patch。
+- 若多步驟工作已明確，使用 tasks 工具更新進度；若缺少必要決策，再使用 ask_user_choice。
+"""
+
+
 _AGENT_SYSTEM_PROMPT_PREFIX = (
     """
 你是運行在受限文字檔工作區中的 AI 程式代理。
@@ -2212,4 +2226,6 @@ _AGENT_SYSTEM_PROMPT_PREFIX = (
 apply_patch 格式要求：
 """
     + _APPLY_PATCH_FORMAT_GUIDANCE
+    + "\n"
+    + _EDITING_WORKFLOW_GUIDANCE
 )
