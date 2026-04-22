@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
-from typing import Any
 from pathlib import PurePosixPath
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -96,6 +97,17 @@ def join_pterodactyl_server_path(base_path: str, relative_path: str) -> str:
 
 
 def _format_pterodactyl_error(status: int, response_text: str) -> str:
+    lowered_text = response_text.lower()
+    if "cloudflare" in lowered_text and ("you have been blocked" in lowered_text or "attention required" in lowered_text):
+        ray_match = re.search(r"Cloudflare Ray ID:\s*<strong[^>]*>([^<]+)</strong>", response_text, flags=re.IGNORECASE)
+        ray_id = ray_match.group(1).strip() if ray_match else ""
+        suffix = f" Cloudflare Ray ID: {ray_id}" if ray_id else ""
+        return (
+            f"Pterodactyl API 請求失敗（{status}）：目標站點的 Cloudflare 已封鎖目前 proxy 的出口 IP。"
+            "請更換 proxy／出口 IP，或請站方放行這個來源。"
+            f"{suffix}"
+        )
+
     details: list[str] = []
     payload: Any = None
     if response_text.strip():
@@ -245,72 +257,68 @@ async def request_pterodactyl_client_api(
         raise PterodactylError(_format_pterodactyl_network_error(exc, settings, url)) from exc
 
 
-    try:
-        async with open_proxy_aware_session(session, settings, require_proxy=True) as request_session:
-            async with request_session.ws_connect(
-                socket_url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Origin": origin,
-                },
-                heartbeat=20,
-                timeout=aiohttp.ClientTimeout(total=max(10, wait_seconds + 5)),
-                **proxy_request_kwargs,
-            ) as websocket:
-                await websocket.send_json({"event": "auth", "args": [token]})
-                while True:
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        message = await asyncio.wait_for(websocket.receive(), timeout=min(remaining, 2.0))
-                    except asyncio.TimeoutError:
-                        continue
+async def fetch_pterodactyl_account(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    base_url: str,
+    api_key: str,
+) -> tuple[UserPterodactylConfig, dict[str, Any]]:
+    normalized_config = UserPterodactylConfig(
+        base_url=normalize_pterodactyl_base_url(base_url),
+        api_key=api_key.strip(),
+    )
+    response = await request_pterodactyl_client_api(
+        session,
+        settings,
+        normalized_config,
+        "GET",
+        "/account",
+        expect="json",
+    )
+    if not isinstance(response.data, dict):
+        raise PterodactylError("Pterodactyl 帳號驗證回應格式無效。")
+    return normalized_config, response.data
 
-                    if message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
-                        break
-                    if message.type is aiohttp.WSMsgType.ERROR:
-                        raise PterodactylError(f"Pterodactyl websocket 錯誤：{websocket.exception()}")
-                    if message.type is not aiohttp.WSMsgType.TEXT:
-                        continue
 
-                    try:
-                        payload = json.loads(message.data)
-                    except json.JSONDecodeError:
-                        daemon_messages.append(str(message.data))
-                        daemon_messages[:] = daemon_messages[-20:]
-                        continue
+async def get_pterodactyl_startup(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    config: UserPterodactylConfig,
+    server: str,
+) -> dict[str, Any]:
+    response = await request_pterodactyl_client_api(
+        session,
+        settings,
+        config,
+        "GET",
+        f"/servers/{server}/startup",
+        expect="json",
+    )
+    if not isinstance(response.data, dict):
+        raise PterodactylError("Pterodactyl startup 回應格式無效。")
+    return response.data
 
-                    event = str(payload.get("event") or "").strip().lower()
-                    args = payload.get("args") if isinstance(payload.get("args"), list) else []
-                    if event == "console output" and args:
-                        raw_output = str(args[0])
-                        lines = raw_output.splitlines() or [raw_output]
-                        for line in lines:
-                            normalized_line = line.rstrip("\r")
-                            if normalized_line:
-                                console_lines.append(normalized_line)
-                        console_lines[:] = console_lines[-max_lines:]
-                        continue
-                    if event == "status" and args:
-                        statuses.append(str(args[0]))
-                        statuses[:] = statuses[-20:]
-                        continue
-                    if event == "stats" and args:
-                        stat_payload = args[0]
-                        stats.append(stat_payload if isinstance(stat_payload, dict) else str(stat_payload))
-                        stats[:] = stats[-5:]
-                        continue
-                    if event == "daemon message" and args:
-                        daemon_messages.append(str(args[0]))
-                        daemon_messages[:] = daemon_messages[-20:]
-                        continue
-                    if event == "jwt error" and args:
-                        jwt_errors.append(str(args[0]))
-                        jwt_errors[:] = jwt_errors[-5:]
-                        continue
-    except ProxyConfigurationError as exc:
-        raise PterodactylError(str(exc)) from exc
+
+async def update_pterodactyl_startup_variable(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    config: UserPterodactylConfig,
+    server: str,
+    key: str,
+    value: str,
+) -> dict[str, Any]:
+    response = await request_pterodactyl_client_api(
+        session,
+        settings,
+        config,
+        "PUT",
+        f"/servers/{server}/startup/variable",
+        body={"key": key, "value": value},
+        expect="json",
+    )
+    if not isinstance(response.data, dict):
+        raise PterodactylError("Pterodactyl startup variable 回應格式無效。")
+    return response.data
 
 
 async def set_pterodactyl_power_state(
@@ -471,74 +479,82 @@ async def read_pterodactyl_console(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait_seconds
 
-    async with session.ws_connect(
-        socket_url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Origin": origin,
-        },
-        heartbeat=20,
-        timeout=aiohttp.ClientTimeout(total=max(10, wait_seconds + 5)),
-        **proxy_request_kwargs,
-    ) as websocket:
-        await websocket.send_json({"event": "auth", "args": [token]})
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                message = await asyncio.wait_for(websocket.receive(), timeout=min(remaining, 2.0))
-            except asyncio.TimeoutError:
-                continue
-
-            if message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
-                break
-            if message.type is aiohttp.WSMsgType.ERROR:
-                raise PterodactylError(f"Pterodactyl websocket 錯誤：{websocket.exception()}")
-            if message.type is not aiohttp.WSMsgType.TEXT:
-                continue
-
-            try:
-                payload = json.loads(message.data)
-            except json.JSONDecodeError:
-                daemon_messages.append(str(message.data))
-                daemon_messages[:] = daemon_messages[-20:]
-                continue
-
-            event = str(payload.get("event") or "").strip().lower()
-            args = payload.get("args") if isinstance(payload.get("args"), list) else []
-            if event == "console output" and args:
-                raw_output = str(args[0])
-                lines = raw_output.splitlines() or [raw_output]
-                for line in lines:
-                    normalized_line = line.rstrip("\r")
-                    if normalized_line:
-                        console_lines.append(normalized_line)
-                console_lines[:] = console_lines[-max_lines:]
-                continue
-            if event == "status" and args:
-                statuses.append(str(args[0]))
-                statuses[:] = statuses[-20:]
-                continue
-            if event == "stats" and args:
-                raw_stats = args[0]
-                if isinstance(raw_stats, str):
+    try:
+        async with open_proxy_aware_session(session, settings, require_proxy=True) as request_session:
+            async with request_session.ws_connect(
+                socket_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Origin": origin,
+                },
+                heartbeat=20,
+                timeout=aiohttp.ClientTimeout(total=max(10, wait_seconds + 5)),
+                **proxy_request_kwargs,
+            ) as websocket:
+                await websocket.send_json({"event": "auth", "args": [token]})
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
                     try:
-                        stats_payload: dict[str, Any] | str = json.loads(raw_stats)
+                        message = await asyncio.wait_for(websocket.receive(), timeout=min(remaining, 2.0))
+                    except asyncio.TimeoutError:
+                        continue
+
+                    if message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
+                        break
+                    if message.type is aiohttp.WSMsgType.ERROR:
+                        raise PterodactylError(f"Pterodactyl websocket 錯誤：{websocket.exception()}")
+                    if message.type is not aiohttp.WSMsgType.TEXT:
+                        continue
+
+                    try:
+                        payload = json.loads(message.data)
                     except json.JSONDecodeError:
-                        stats_payload = raw_stats
-                else:
-                    stats_payload = raw_stats if isinstance(raw_stats, dict) else str(raw_stats)
-                stats.append(stats_payload)
-                stats[:] = stats[-5:]
-                continue
-            if event == "daemon message" and args:
-                daemon_messages.append(str(args[0]))
-                daemon_messages[:] = daemon_messages[-20:]
-                continue
-            if event == "jwt error" and args:
-                jwt_errors.append(str(args[0]))
-                jwt_errors[:] = jwt_errors[-10:]
+                        daemon_messages.append(str(message.data))
+                        daemon_messages[:] = daemon_messages[-20:]
+                        continue
+
+                    event = str(payload.get("event") or "").strip().lower()
+                    args = payload.get("args") if isinstance(payload.get("args"), list) else []
+                    if event == "console output" and args:
+                        raw_output = str(args[0])
+                        lines = raw_output.splitlines() or [raw_output]
+                        for line in lines:
+                            normalized_line = line.rstrip("\r")
+                            if normalized_line:
+                                console_lines.append(normalized_line)
+                        console_lines[:] = console_lines[-max_lines:]
+                        continue
+                    if event == "status" and args:
+                        statuses.append(str(args[0]))
+                        statuses[:] = statuses[-20:]
+                        continue
+                    if event == "stats" and args:
+                        raw_stats = args[0]
+                        if isinstance(raw_stats, str):
+                            try:
+                                stats_payload: dict[str, Any] | str = json.loads(raw_stats)
+                            except json.JSONDecodeError:
+                                stats_payload = raw_stats
+                        else:
+                            stats_payload = raw_stats if isinstance(raw_stats, dict) else str(raw_stats)
+                        stats.append(stats_payload)
+                        stats[:] = stats[-5:]
+                        continue
+                    if event == "daemon message" and args:
+                        daemon_messages.append(str(args[0]))
+                        daemon_messages[:] = daemon_messages[-20:]
+                        continue
+                    if event == "jwt error" and args:
+                        jwt_errors.append(str(args[0]))
+                        jwt_errors[:] = jwt_errors[-10:]
+    except ProxyConfigurationError as exc:
+        raise PterodactylError(str(exc)) from exc
+    except PterodactylError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise PterodactylError(_format_pterodactyl_network_error(exc, settings, socket_url)) from exc
 
     return {
         "console": console_lines,
