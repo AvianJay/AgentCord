@@ -152,6 +152,39 @@ def _decode_response_data(response: aiohttp.ClientResponse, response_text: str, 
         return response_text
 
 
+def _redact_proxy_url(proxy_url: str) -> str:
+    parsed = urlsplit(proxy_url)
+    if not parsed.scheme or not parsed.hostname:
+        return "已設定的 proxy"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
+def _format_pterodactyl_network_error(exc: BaseException, settings: Settings, request_url: str) -> str:
+    target_host = urlsplit(request_url).netloc or request_url
+    if settings.proxy_url:
+        proxy_label = _redact_proxy_url(settings.proxy_url)
+        if isinstance(exc, aiohttp.ServerDisconnectedError):
+            return (
+                "Pterodactyl 網路請求失敗：proxy 在建立連線時提前中斷。"
+                f"目標：{target_host}；proxy：{proxy_label}。"
+                "這通常不是 API key 被拒絕，而是 proxy 設定、proxy 驗證，或 proxy 不允許連到該 HTTPS 主機。"
+            )
+        if isinstance(exc, asyncio.TimeoutError):
+            return (
+                "Pterodactyl 網路請求逾時：透過 proxy 連線到目標主機時未在時間內完成。"
+                f"目標：{target_host}；proxy：{proxy_label}。"
+                "請檢查 proxy 是否可連外、是否允許 CONNECT 到該主機，以及 DNS 是否可解析。"
+            )
+        return (
+            "Pterodactyl 網路請求失敗：無法透過 proxy 完成連線。"
+            f"目標：{target_host}；proxy：{proxy_label}；錯誤：{type(exc).__name__}: {exc}"
+        )
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"Pterodactyl 網路請求逾時：連線到 {target_host} 時未在時間內完成。"
+    return f"Pterodactyl 網路請求失敗：連線到 {target_host} 時發生 {type(exc).__name__}: {exc}"
+
+
 async def request_pterodactyl_client_api(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -193,23 +226,28 @@ async def request_pterodactyl_client_api(
         headers["Content-Type"] = content_type or "application/json"
     params = {str(key): value for key, value in (query or {}).items()}
 
-    async with session.request(
-        normalized_method,
-        url,
-        params=params,
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=45),
-        **proxy_request_kwargs,
-        **request_kwargs,
-    ) as response:
-        response_text = await response.text()
-        if response.status >= 400:
-            raise PterodactylError(_format_pterodactyl_error(response.status, response_text))
-        return PterodactylResponse(
-            status=response.status,
-            data=_decode_response_data(response, response_text, normalized_expect),
-            text=response_text,
-        )
+    try:
+        async with session.request(
+            normalized_method,
+            url,
+            params=params,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=45),
+            **proxy_request_kwargs,
+            **request_kwargs,
+        ) as response:
+            response_text = await response.text()
+            if response.status >= 400:
+                raise PterodactylError(_format_pterodactyl_error(response.status, response_text))
+            return PterodactylResponse(
+                status=response.status,
+                data=_decode_response_data(response, response_text, normalized_expect),
+                text=response_text,
+            )
+    except PterodactylError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise PterodactylError(_format_pterodactyl_network_error(exc, settings, url)) from exc
 
 
 async def fetch_pterodactyl_account(
