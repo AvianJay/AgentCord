@@ -77,6 +77,51 @@ class AgentReviewTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["path"] for item in changes], ["src/posts.ts"])
         self.assertEqual(self.workspace.read_file(self.user_id, "src/posts.ts"), "export const count = 2;\n")
 
+    async def test_restore_file_reverts_tracked_change_and_clears_review_entry(self) -> None:
+        self.workspace.write_file(self.user_id, "src/app.ts", "const value = 1;\n")
+        token = _CURRENT_TASK_ID.set(self.task_id)
+        self.addCleanup(_CURRENT_TASK_ID.reset, token)
+
+        await self.agent._tool_write_file(
+            self.user_id,
+            {"tool": "write_file", "path": "src/app.ts", "content": "const value = 2;\n"},
+            [],
+            None,
+        )
+
+        result, touched_files, _ = await self.agent._tool_restore_file(
+            self.user_id,
+            {"tool": "restore_file", "path": "src/app.ts"},
+            [],
+            None,
+        )
+
+        self.assertEqual(result, {"path": "src/app.ts", "result": "restored"})
+        self.assertEqual(touched_files, ["src/app.ts"])
+        self.assertEqual(self.workspace.read_file(self.user_id, "src/app.ts"), "const value = 1;\n")
+        self.assertEqual(self.workspace.list_task_file_changes(self.user_id, self.task_id), [])
+
+    async def test_restore_deleted_new_python_file_skips_compile_validation(self) -> None:
+        token = _CURRENT_TASK_ID.set(self.task_id)
+        self.addCleanup(_CURRENT_TASK_ID.reset, token)
+
+        await self.agent._tool_write_file(
+            self.user_id,
+            {"tool": "write_file", "path": "src/new_file.py", "content": "print('ok')\n"},
+            [],
+            None,
+        )
+
+        await self.agent._tool_restore_file(
+            self.user_id,
+            {"tool": "restore_file", "path": "src/new_file.py"},
+            [],
+            None,
+        )
+
+        self.assertFalse(self.workspace.file_exists(self.user_id, "src/new_file.py"))
+        self.assertEqual(self.agent._validate_changed_python_files(self.user_id, ["src/new_file.py"]), [])
+
 
 if __name__ == "__main__":
     unittest.main()

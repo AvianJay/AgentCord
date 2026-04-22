@@ -75,6 +75,10 @@ class WorkspaceManager:
             raise WorkspaceError(f"找不到檔案：{path}")
         return absolute.read_text(encoding="utf-8")
 
+    def file_exists(self, user_id: int, path: str) -> bool:
+        absolute = self._resolve_path(user_id, path)
+        return absolute.is_file()
+
     def write_file(self, user_id: int, path: str, content: str) -> int:
         self._assert_text(content)
         absolute = self._resolve_path(user_id, path)

@@ -517,6 +517,18 @@ class CodingAgent:
                 handler_name="_tool_delete_file",
             ),
             AgentToolSpec(
+                name="restore_file",
+                description="將目前 task 中已追蹤的檔案還原到 AI 修改前版本。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要還原的工作區檔案路徑。"},
+                    },
+                    "required": ["path"],
+                },
+                handler_name="_tool_restore_file",
+            ),
+            AgentToolSpec(
                 name="create_folder",
                 description="建立資料夾。",
                 parameters={
@@ -1103,6 +1115,18 @@ class CodingAgent:
             self._discard_task_file_changes(user_id, staged_paths)
             raise
         return ({"path": path, "result": "ok"}, [path], current_task_items)
+
+    async def _tool_restore_file(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = self._require_string_argument(action, "path")
+        self.workspace.revert_task_file_change(user_id, self._require_active_task_id(), path)
+        return ({"path": path, "result": "restored"}, [path], current_task_items)
 
     async def _tool_create_folder(
         self,
@@ -1918,6 +1942,8 @@ class CodingAgent:
     def _validate_changed_python_files(self, user_id: int, touched_files: list[str]) -> list[str]:
         validations: list[str] = []
         for path in sorted({item for item in touched_files if item.endswith(".py")}):
+            if not self.workspace.file_exists(user_id, path):
+                continue
             try:
                 validations.append(self.workspace.py_compile_check(user_id, path))
             except Exception as exc:  # noqa: BLE001
@@ -2098,6 +2124,7 @@ class CodingAgent:
             "write_file": "寫入檔案",
             "list_files": "列出路徑",
             "delete_file": "刪除檔案",
+            "restore_file": "還原檔案",
             "create_folder": "建立資料夾",
             "remove_folder": "刪除資料夾",
             "apply_patch": "套用 patch",
@@ -2131,6 +2158,8 @@ class CodingAgent:
             return f"列出路徑中：{action.get('path', '.') }"
         if tool_name == "delete_file":
             return f"刪除檔案中：{action.get('path', '')}"
+        if tool_name == "restore_file":
+            return f"還原檔案中：{action.get('path', '')}"
         if tool_name == "create_folder":
             return f"建立資料夾中：{action.get('path', '')}"
         if tool_name == "remove_folder":
@@ -2176,7 +2205,7 @@ class CodingAgent:
 
     def _format_tool_finish_message(self, tool_name: Any, action: dict[str, Any]) -> str:
         tool_name = self._normalize_tool_name(tool_name)
-        if tool_name in {"read_file", "write_file", "delete_file", "create_folder", "remove_folder", "py_compile_check"}:
+        if tool_name in {"read_file", "write_file", "delete_file", "restore_file", "create_folder", "remove_folder", "py_compile_check"}:
             return f"{self._format_tool_label(tool_name)}已完成：{action.get('path', '')}"
         if tool_name == "list_files":
             return f"列出路徑已完成：{action.get('path', '.') }"
