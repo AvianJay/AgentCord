@@ -1105,7 +1105,12 @@ class CodingAgent:
         progress_callback: ProgressCallback | None,
     ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
         del user_id
-        message = self._require_string_argument(action, "message", allow_empty=True)
+        message = self._require_string_argument_with_aliases(
+            action,
+            "message",
+            aliases=("content", "text", "prompt"),
+            allow_empty=True,
+        )
         self._append_conversation_message("assistant", message)
         await self._emit_chat_message(progress_callback, "assistant", message)
         return ({"message": message, "result": "sent"}, [], current_task_items)
@@ -1118,7 +1123,12 @@ class CodingAgent:
         progress_callback: ProgressCallback | None,
     ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
         del user_id
-        message = self._require_string_argument(action, "message", allow_empty=True)
+        message = self._require_string_argument_with_aliases(
+            action,
+            "message",
+            aliases=("question", "prompt", "content", "text"),
+            allow_empty=True,
+        )
         placeholder = str(action.get("placeholder") or "").strip()
         allow_freeform = self._coerce_bool(action.get("allow_freeform"), default=False)
         freeform_placeholder = str(action.get("freeform_placeholder") or "").strip()
@@ -1465,6 +1475,26 @@ class CodingAgent:
         if not allow_empty and not value.strip():
             raise ValueError(f"工具 {action.get('tool')} 缺少字串參數：{key}。")
         return value if allow_empty else value.strip()
+
+    def _require_string_argument_with_aliases(
+        self,
+        action: dict[str, Any],
+        key: str,
+        *,
+        aliases: tuple[str, ...] = (),
+        allow_empty: bool = False,
+    ) -> str:
+        candidates = (key, *aliases)
+        for candidate in candidates:
+            value = action.get(candidate)
+            if not isinstance(value, str):
+                continue
+            if allow_empty:
+                return value
+            normalized = value.strip()
+            if normalized:
+                return normalized
+        raise ValueError(f"工具 {action.get('tool')} 缺少字串參數：{key}。")
 
     def _optional_object_argument(self, action: dict[str, Any], key: str) -> dict[str, Any] | None:
         value = action.get(key)
