@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import re
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from agentcord.proxy import ProxyConfigurationError, build_proxy_request_kwargs,
 
 _CLIENT_ACCEPT_HEADER = "Application/vnd.pterodactyl.v1+json"
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+_REMOTE_ENUMERATION_HARD_IGNORES = {".venv", "venv", "node_modules", "__pycache__"}
 
 
 class PterodactylError(ValueError):
@@ -491,9 +493,13 @@ async def collect_pterodactyl_server_files(
     config: UserPterodactylConfig,
     server: str,
     path: str,
+    *,
+    ignore_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     normalized_path = normalize_pterodactyl_server_path(path)
     files: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    active_patterns = _build_remote_sync_ignore_patterns(ignore_patterns)
 
     async def visit(directory_path: str, prefix: str) -> None:
         entries = await list_pterodactyl_server_directory(session, settings, config, server, directory_path)
@@ -503,7 +509,11 @@ async def collect_pterodactyl_server_files(
                 continue
             remote_item_path = join_pterodactyl_server_path(directory_path, name)
             relative_path = name if not prefix else f"{prefix}/{name}"
-            if entry.get("kind") == "folder":
+            is_dir = entry.get("kind") == "folder"
+            if _should_ignore_remote_sync_path(relative_path, is_dir=is_dir, ignore_patterns=active_patterns):
+                skipped.append({"path": remote_item_path, "reason": "ignored"})
+                continue
+            if is_dir:
                 await visit(remote_item_path, relative_path)
                 continue
             files.append(
@@ -521,6 +531,7 @@ async def collect_pterodactyl_server_files(
             "source_path": normalized_path,
             "source_kind": "folder",
             "files": files,
+            "skipped": skipped,
         }
     except PterodactylError as exc:
         if normalized_path == "/":
@@ -530,6 +541,13 @@ async def collect_pterodactyl_server_files(
         except PterodactylError:
             raise exc
         file_name = PurePosixPath(normalized_path).name or "file"
+        if _should_ignore_remote_sync_path(file_name, is_dir=False, ignore_patterns=active_patterns):
+            return {
+                "source_path": normalized_path,
+                "source_kind": "file",
+                "files": [],
+                "skipped": [{"path": normalized_path, "reason": "ignored"}],
+            }
         return {
             "source_path": normalized_path,
             "source_kind": "file",
@@ -541,7 +559,36 @@ async def collect_pterodactyl_server_files(
                     "mimetype": "text/plain",
                 }
             ],
+            "skipped": skipped,
         }
+
+
+def _build_remote_sync_ignore_patterns(patterns: list[str] | None) -> set[str]:
+    normalized_patterns = {
+        pattern.strip().replace("\\", "/").lower()
+        for pattern in _REMOTE_ENUMERATION_HARD_IGNORES
+        if pattern.strip()
+    }
+    normalized_patterns.update({
+        str(pattern).strip().replace("\\", "/").lower()
+        for pattern in patterns or []
+        if str(pattern).strip()
+    })
+    return normalized_patterns
+
+
+def _should_ignore_remote_sync_path(relative_path: str, *, is_dir: bool, ignore_patterns: set[str]) -> bool:
+    candidates = {relative_path.strip("/").lower()}
+    candidates = {candidate for candidate in candidates if candidate and candidate != "."}
+    names = {PurePosixPath(candidate).name for candidate in candidates}
+    for pattern in ignore_patterns:
+        if any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates):
+            return True
+        if any(fnmatch.fnmatch(name, pattern) for name in names):
+            return True
+        if is_dir and any(fnmatch.fnmatch(f"{candidate}/", pattern.rstrip("/") + "/") for candidate in candidates):
+            return True
+    return False
 
 
 async def get_pterodactyl_websocket_credentials(

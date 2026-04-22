@@ -733,27 +733,27 @@ class AgentConversationView(discord.ui.LayoutView):
 
     async def _on_interrupt(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user.id:
-            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
         await interaction.response.defer()
         await self.session.interrupt()
 
     async def _on_send_message(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user.id:
-            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
         await interaction.response.send_modal(AgentMessageModal(self.session))
 
     async def _on_refresh(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user.id:
-            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
         await interaction.response.defer()
         await self.session.request_render(force=True)
 
     async def _on_cancel_choice(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user.id:
-            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
         await interaction.response.defer()
         self.session._cancel_pending_choice("使用者取消了選項選擇。")
@@ -761,7 +761,7 @@ class AgentConversationView(discord.ui.LayoutView):
 
     async def _on_freeform_choice(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user.id:
-            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
         if self.session._pending_choice is None or not self.session._pending_choice.allow_freeform:
             await interaction.response.send_message("目前不接受自由輸入。", ephemeral=True)
@@ -828,7 +828,7 @@ class AgentChoiceSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.parent_view.session.user.id:
-            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
         if self.parent_view.session._pending_choice is None:
             await interaction.response.send_message("目前沒有待選項目。", ephemeral=True)
