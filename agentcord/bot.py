@@ -28,6 +28,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "call-ai-codeing": "叫ai寫程式",
     "agent-history": "代理歷史",
     "agent-open": "開啟代理對話",
+    "delete-agent": "刪除代理對話",
     "set-model": "設定模型",
     "set-pterodactyl": "設定翼手龍",
     "custom-model": "自訂模型",
@@ -400,6 +401,32 @@ def register_commands(bot: AgentCordBot) -> None:
         if prompt and prompt.strip():
             await session.enqueue_prompt(prompt)
 
+    @bot.tree.command(name="delete-agent", description="刪除既有的 agent 對話。")
+    @app_commands.describe(task_id="要刪除的對話編號。")
+    async def delete_agent(interaction: discord.Interaction, task_id: int) -> None:
+        task = bot.db.get_task(interaction.user.id, task_id)
+        existing_session = bot.agent_sessions.get(interaction.user.id)
+        if existing_session is not None and existing_session.task_id == task_id:
+            if existing_session.is_busy():
+                raise ValueError("這個 agent 對話正在執行，請先等待完成或按下中斷。")
+            await existing_session.close("這個對話已刪除。")
+            if bot.agent_sessions.get(interaction.user.id) is existing_session:
+                bot.agent_sessions.pop(interaction.user.id, None)
+
+        deleted_task = bot.db.delete_task(interaction.user.id, task_id)
+        await log_interaction(
+            interaction,
+            "刪除既有 agent 對話。",
+            fields=[
+                ("Task ID", str(task_id), True),
+                ("標題", preview_text(deleted_task.title, 100), False),
+            ],
+        )
+        await interaction.response.send_message(
+            f"已刪除 agent 對話 #{deleted_task.id}：{deleted_task.title}",
+            ephemeral=True,
+        )
+
     @bot.tree.command(name="set-model", description="設定你的 Pollinations 模型。")
     @app_commands.describe(model="設定 /ask 與 /agent 使用的 Pollinations 模型。")
     async def set_model(interaction: discord.Interaction, model: str) -> None:
@@ -689,6 +716,7 @@ def register_commands(bot: AgentCordBot) -> None:
     @agent_alias.error
     @agent_history.error
     @agent_open.error
+    @delete_agent.error
     @set_model.error
     @set_pterodactyl.error
     @custom_model.error

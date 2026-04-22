@@ -289,6 +289,59 @@ async def fetch_pterodactyl_account(
     return normalized_config, response.data
 
 
+async def list_pterodactyl_servers(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    config: UserPterodactylConfig,
+) -> list[dict[str, Any]]:
+    response = await request_pterodactyl_client_api(
+        session,
+        settings,
+        config,
+        "GET",
+        "/",
+        expect="json",
+    )
+
+    raw_items: Any = None
+    if isinstance(response.data, dict):
+        if isinstance(response.data.get("data"), list):
+            raw_items = response.data.get("data")
+        elif isinstance(response.data.get("servers"), list):
+            raw_items = response.data.get("servers")
+    elif isinstance(response.data, list):
+        raw_items = response.data
+    if not isinstance(raw_items, list):
+        raise PterodactylError("Pterodactyl 伺服器列表回應格式無效。")
+
+    servers: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else item
+        if not isinstance(attributes, dict):
+            continue
+        identifier = str(attributes.get("identifier") or "").strip()
+        uuid = str(attributes.get("uuid") or "").strip()
+        name = str(attributes.get("name") or "").strip()
+        if not identifier and not uuid and not name:
+            continue
+        servers.append(
+            {
+                "identifier": identifier,
+                "uuid": uuid,
+                "name": name,
+                "description": str(attributes.get("description") or "").strip(),
+                "node": str(attributes.get("node") or "").strip(),
+                "is_owner": bool(attributes.get("server_owner")),
+                "is_suspended": bool(attributes.get("is_suspended")),
+                "is_installing": bool(attributes.get("is_installing")),
+                "current_state": str(attributes.get("current_state") or "").strip(),
+            }
+        )
+    return servers
+
+
 async def get_pterodactyl_startup(
     session: aiohttp.ClientSession,
     settings: Settings,

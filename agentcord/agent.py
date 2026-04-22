@@ -18,6 +18,7 @@ from agentcord.pterodactyl import (
     create_pterodactyl_server_folder,
     get_pterodactyl_startup,
     join_pterodactyl_server_path,
+    list_pterodactyl_servers,
     read_pterodactyl_console,
     read_pterodactyl_server_file,
     request_pterodactyl_client_api,
@@ -615,6 +616,15 @@ class CodingAgent:
                 handler_name="_tool_sleep",
             ),
             AgentToolSpec(
+                name="pterodactyl_list_servers",
+                description="列出目前使用者 Pterodactyl 帳號可存取的伺服器。",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+                handler_name="_tool_pterodactyl_list_servers",
+            ),
+            AgentToolSpec(
                 name="pterodactyl_read_startup",
                 description="讀取指定伺服器的 startup 設定與可編輯環境變數。",
                 parameters={
@@ -749,7 +759,7 @@ class CodingAgent:
                 description=(
                     "呼叫目前使用者已設定好的 Pterodactyl Client API。"
                     "path 必須是相對於 /api/client 的路徑，例如 /account、/servers/{server}、/servers/{server}/resources、"
-                    "/servers/{server}/command。若要列出伺服器，請使用 GET 並將 path 設為 /。"
+                    "/servers/{server}/command。"
                     "若要讀取伺服器檔案內容，可使用 GET /servers/{server}/files/contents，"
                     "並在 query 提供 {\"file\": \"/path/to/file\"}，expect 設為 text。"
                 ),
@@ -1212,6 +1222,22 @@ class CodingAgent:
             server,
         )
         return ({"server": server, "result": result}, [], current_task_items)
+
+    async def _tool_pterodactyl_list_servers(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        del action
+        result = await list_pterodactyl_servers(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+        )
+        return ({"count": len(result), "result": result}, [], current_task_items)
 
     async def _tool_pterodactyl_set_startup_variable(
         self,

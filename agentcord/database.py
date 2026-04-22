@@ -347,6 +347,15 @@ class Database:
         ).fetchall()
         return [self._row_to_task_record(row) for row in rows]
 
+    def delete_task(self, user_id: int, task_id: int) -> TaskRecord:
+        task = self.get_task(user_id, task_id)
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM tasks WHERE user_id = ? AND id = ?",
+                (user_id, task_id),
+            )
+        return task
+
     def prune_task_history(self, user_id: int, keep: int = 20) -> None:
         rows = self._connection.execute(
             "SELECT id FROM tasks WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
