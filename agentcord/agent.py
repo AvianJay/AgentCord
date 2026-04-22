@@ -572,7 +572,7 @@ class CodingAgent:
             ),
             AgentToolSpec(
                 name="ask_user_choice",
-                description="向使用者顯示一組選項並等待對方選擇後再繼續。",
+                description="向使用者顯示選項並等待回覆，支援單選、多選與自由輸入。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -580,7 +580,7 @@ class CodingAgent:
                         "placeholder": {"type": "string", "description": "選單 placeholder。"},
                         "options": {
                             "type": "array",
-                            "description": "可選項目列表。",
+                            "description": "可選項目列表；若 allow_freeform=true，也可以留空。",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -591,8 +591,12 @@ class CodingAgent:
                                 "required": ["label", "value"],
                             },
                         },
+                        "min_choices": {"type": "integer", "description": "最少需要選幾項，預設 1。"},
+                        "max_choices": {"type": "integer", "description": "最多可選幾項，預設 1。"},
+                        "allow_freeform": {"type": "boolean", "description": "是否允許使用者改用自由輸入。"},
+                        "freeform_placeholder": {"type": "string", "description": "自由輸入視窗的 placeholder。"},
                     },
-                    "required": ["message", "options"],
+                    "required": ["message"],
                 },
                 handler_name="_tool_ask_user_choice",
             ),
@@ -1115,22 +1119,48 @@ class CodingAgent:
         del user_id
         message = self._require_string_argument(action, "message", allow_empty=True)
         placeholder = str(action.get("placeholder") or "").strip()
-        options = self._require_choice_options(action)
+        allow_freeform = self._coerce_bool(action.get("allow_freeform"), default=False)
+        freeform_placeholder = str(action.get("freeform_placeholder") or "").strip()
+        options = self._require_choice_options(action, allow_empty=allow_freeform)
+        if not options and not allow_freeform:
+            raise ValueError(f"工具 {action.get('tool')} 至少需要 options 或 allow_freeform=true。")
+        min_choices = self._optional_integer_argument(action, "min_choices", minimum=1, maximum=25) or 1
+        max_choices = self._optional_integer_argument(action, "max_choices", minimum=1, maximum=25) or 1
+        if options:
+            max_choices = min(max_choices, len(options))
+            min_choices = min(min_choices, max_choices)
+        else:
+            min_choices = 0
+            max_choices = 0
         self._append_conversation_message("assistant", message)
         selection = await self._request_user_choice(
             progress_callback,
             message,
             options,
             placeholder=placeholder,
+            min_values=min_choices,
+            max_values=max_choices,
+            allow_freeform=allow_freeform,
+            freeform_placeholder=freeform_placeholder,
         )
-        selected_label = str(selection.get("label") or selection.get("value") or "").strip()
-        selected_value = str(selection.get("value") or selected_label).strip()
-        self._append_conversation_message("user", selected_label)
+        selected_entries = [
+            item
+            for item in selection.get("selections", [])
+            if isinstance(item, dict)
+        ]
+        input_text = str(selection.get("input") or "").strip()
+        selected = selected_entries[0] if selected_entries else None
+        history_message = self._format_choice_history_message(selected_entries, input_text)
+        if history_message:
+            self._append_conversation_message("user", history_message)
         return (
             {
                 "message": message,
-                "selected": {"label": selected_label, "value": selected_value},
-                "result": "selected",
+                "mode": str(selection.get("mode") or "selection"),
+                "selected": selected,
+                "selections": selected_entries,
+                "input": input_text or None,
+                "result": "selected" if selected_entries else "submitted",
             },
             [],
             current_task_items,
@@ -1339,6 +1369,8 @@ class CodingAgent:
                 "source_path": manifest["source_path"],
                 "remote_path": remote_path,
                 "dry_run": dry_run,
+                "workspace_total_size": manifest["total_size"],
+                "workspace_limit_bytes": manifest["limit_bytes"],
                 "ignore_patterns": manifest["ignore_patterns"],
                 "file_count": len(files),
                 "skipped_count": len(manifest["skipped"]),
@@ -1456,10 +1488,14 @@ class CodingAgent:
                 result.append(normalized)
         return result
 
-    def _require_choice_options(self, action: dict[str, Any]) -> list[dict[str, str]]:
+    def _require_choice_options(self, action: dict[str, Any], *, allow_empty: bool = False) -> list[dict[str, str]]:
         raw_options = action.get("options")
-        if not isinstance(raw_options, list) or not raw_options:
-            raise ValueError(f"工具 {action.get('tool')} 需要至少一個 options 項目。")
+        if raw_options is None:
+            return [] if allow_empty else self._raise_missing_choice_options(action)
+        if not isinstance(raw_options, list):
+            raise ValueError(f"工具 {action.get('tool')} 的 options 必須是陣列。")
+        if not raw_options:
+            return [] if allow_empty else self._raise_missing_choice_options(action)
         options: list[dict[str, str]] = []
         for index, item in enumerate(raw_options[:25], start=1):
             if not isinstance(item, dict):
@@ -1471,6 +1507,17 @@ class CodingAgent:
                 raise ValueError(f"工具 {action.get('tool')} 的 options[{index}] 缺少 label 或 value。")
             options.append({"label": label, "value": value, "description": description})
         return options
+
+    def _raise_missing_choice_options(self, action: dict[str, Any]) -> list[dict[str, str]]:
+            raise ValueError(f"工具 {action.get('tool')} 需要至少一個 options 項目。")
+
+    def _format_choice_history_message(self, selections: list[dict[str, str]], input_text: str) -> str:
+        normalized_input = input_text.strip()
+        if normalized_input:
+            return normalized_input
+        labels = [str(item.get("label") or item.get("value") or "").strip() for item in selections]
+        labels = [label for label in labels if label]
+        return "、".join(labels)
 
     def _append_conversation_message(self, role: str, content: str) -> None:
         normalized = str(content).strip()
@@ -1498,7 +1545,11 @@ class CodingAgent:
         options: list[dict[str, str]],
         *,
         placeholder: str = "",
-    ) -> dict[str, str]:
+        min_values: int = 1,
+        max_values: int = 1,
+        allow_freeform: bool = False,
+        freeform_placeholder: str = "",
+    ) -> dict[str, Any]:
         if progress_callback is None:
             raise ValueError("目前無法向使用者請求選項。")
         maybe_result = progress_callback(
@@ -1507,6 +1558,10 @@ class CodingAgent:
                 "message": message,
                 "placeholder": placeholder,
                 "options": options,
+                "min_values": min_values,
+                "max_values": max_values,
+                "allow_freeform": allow_freeform,
+                "freeform_placeholder": freeform_placeholder,
             }
         )
         if inspect.isawaitable(maybe_result):
@@ -1515,10 +1570,58 @@ class CodingAgent:
             result = maybe_result
         if not isinstance(result, dict):
             raise ValueError("使用者選項回應格式無效。")
+        normalized_selections: list[dict[str, str]] = []
+        raw_selections = result.get("selections")
+        if isinstance(raw_selections, list):
+            for index, item in enumerate(raw_selections[:25], start=1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"使用者選項回應的 selections[{index}] 格式無效。")
+                label = str(item.get("label") or item.get("value") or "").strip()
+                value = str(item.get("value") or item.get("label") or "").strip()
+                if not label or not value:
+                    raise ValueError(f"使用者選項回應的 selections[{index}] 缺少 label 或 value。")
+                normalized_selections.append({"label": label, "value": value})
+        if not normalized_selections:
+            label = str(result.get("label") or result.get("value") or "").strip()
+            value = str(result.get("value") or result.get("label") or "").strip()
+            if label and value:
+                normalized_selections.append({"label": label, "value": value})
+        input_text = str(result.get("input") or "").strip()
+        if not normalized_selections and not input_text:
+            raise ValueError("使用者選項回應內容為空。")
+        selected = normalized_selections[0] if normalized_selections else {"label": input_text, "value": input_text}
         return {
-            "label": str(result.get("label") or "").strip(),
-            "value": str(result.get("value") or "").strip(),
+            "mode": str(result.get("mode") or ("freeform" if input_text and not normalized_selections else "selection")).strip() or "selection",
+            "label": selected["label"],
+            "value": selected["value"],
+            "selections": normalized_selections,
+            "input": input_text,
         }
+
+    def _optional_integer_argument(
+        self,
+        action: dict[str, Any],
+        key: str,
+        *,
+        minimum: int | None = None,
+        maximum: int | None = None,
+    ) -> int | None:
+        value = action.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"工具 {action.get('tool')} 的 {key} 參數必須是整數。")
+        if isinstance(value, int):
+            number = value
+        elif isinstance(value, float) and value.is_integer():
+            number = int(value)
+        else:
+            raise ValueError(f"工具 {action.get('tool')} 的 {key} 參數必須是整數。")
+        if minimum is not None and number < minimum:
+            raise ValueError(f"工具 {action.get('tool')} 的 {key} 不能小於 {minimum}。")
+        if maximum is not None and number > maximum:
+            raise ValueError(f"工具 {action.get('tool')} 的 {key} 不能大於 {maximum}。")
+        return number
 
     def _require_number_argument(
         self,
@@ -1717,7 +1820,7 @@ class CodingAgent:
             "search_web": "搜尋網路",
             "fetch_url": "抓取網址",
             "send_message": "發送訊息",
-            "ask_user_choice": "請使用者選擇",
+            "ask_user_choice": "請使用者回覆",
             "sleep": "等待",
             "pterodactyl_read_startup": "讀取 startup",
             "pterodactyl_set_startup_variable": "更新 startup 變數",
@@ -1758,7 +1861,7 @@ class CodingAgent:
         if tool_name == "send_message":
             return "發送訊息中。"
         if tool_name == "ask_user_choice":
-            return "等待使用者選擇中。"
+            return "等待使用者回覆中。"
         if tool_name == "sleep":
             return f"等待中：{action.get('seconds', '')} 秒"
         if tool_name == "pterodactyl_read_startup":
@@ -1796,7 +1899,7 @@ class CodingAgent:
         if tool_name == "send_message":
             return "訊息已發送。"
         if tool_name == "ask_user_choice":
-            return "已收到使用者選擇。"
+            return "已收到使用者回覆。"
         if tool_name == "sleep":
             return "等待已完成。"
         if tool_name in {
@@ -1893,7 +1996,7 @@ _AGENT_SYSTEM_PROMPT_PREFIX = """
 - summary 與 related_files 內容請使用繁體中文。
 - fetch_url 可直接抓取公開網址內容；若設定了 PROXY_* 環境變數，會透過 proxy 抓取，不需要先經過 search_web。
 - 可使用 send_message 在執行中直接對使用者說明你正在做什麼、遇到什麼情況、或通知下一步。
-- 若需要使用者做明確決策，請使用 ask_user_choice，而不是自己猜測。收到選擇後再繼續操作。
+- 若需要使用者做明確決策，請使用 ask_user_choice，而不是自己猜測。它支援單選、多選與自由輸入，收到回覆後再繼續操作。
 - 若使用者已透過 /set-pterodactyl 設定 Pterodactyl Client API，可使用 pterodactyl_request 查詢或操作其有權限的伺服器資源。
 - pterodactyl_sync_workspace 會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄；如有需要可額外提供 ignore_patterns。
 - pterodactyl_read_console 只能擷取建立連線後的 live 輸出；若要觀察啟動過程，請在 power_action 後立刻呼叫，必要時再搭配 sleep。

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import discord
 
@@ -51,7 +51,11 @@ class PendingChoiceState:
     prompt: str
     options: list[ChoiceOptionEntry]
     placeholder: str
-    future: asyncio.Future[dict[str, str]]
+    future: asyncio.Future[dict[str, Any]]
+    min_values: int = 1
+    max_values: int = 1
+    allow_freeform: bool = False
+    freeform_placeholder: str = ""
 
 
 class AgentConversationSession:
@@ -359,11 +363,20 @@ class AgentConversationSession:
         if self._pending_choice is None:
             return "## 請選擇\n(目前沒有待選項目)"
         lines = ["## 請選擇", self._shorten(" ".join(self._pending_choice.prompt.split()), 180)]
-        for index, option in enumerate(self._pending_choice.options, start=1):
-            option_line = f"{index}. {self._shorten(option.label, 90)}"
-            if option.description:
-                option_line = f"{option_line} | {self._shorten(option.description, 70)}"
-            lines.append(option_line)
+        if self._pending_choice.options:
+            if self._pending_choice.min_values == self._pending_choice.max_values:
+                lines.append(f"需要選擇 {self._pending_choice.min_values} 項。")
+            else:
+                lines.append(f"可選擇 {self._pending_choice.min_values} 到 {self._pending_choice.max_values} 項。")
+            for index, option in enumerate(self._pending_choice.options, start=1):
+                option_line = f"{index}. {self._shorten(option.label, 90)}"
+                if option.description:
+                    option_line = f"{option_line} | {self._shorten(option.description, 70)}"
+                lines.append(option_line)
+        else:
+            lines.append("(此題沒有預設選項，請改用下方自由輸入。)")
+        if self._pending_choice.allow_freeform:
+            lines.append("可改用自由輸入。")
         return "\n".join(lines)
 
     def _render_tasks_block(self) -> str:
@@ -456,15 +469,17 @@ class AgentConversationSession:
             return f"> {formatted}"
         return formatted
 
-    async def _request_user_choice(self, event: dict[str, object]) -> dict[str, str]:
+    async def _request_user_choice(self, event: dict[str, object]) -> dict[str, Any]:
         if self._pending_choice is not None:
             raise ValueError("目前已有一個待選的使用者選項。")
         prompt = str(event.get("message") or "").strip()
         if not prompt:
             raise ValueError("選項請求缺少 message。")
         raw_options = event.get("options")
-        if not isinstance(raw_options, list) or not raw_options:
-            raise ValueError("選項請求缺少 options。")
+        if raw_options is None:
+            raw_options = []
+        if not isinstance(raw_options, list):
+            raise ValueError("選項請求的 options 格式無效。")
         options: list[ChoiceOptionEntry] = []
         for index, item in enumerate(raw_options[:25], start=1):
             if not isinstance(item, dict):
@@ -475,13 +490,28 @@ class AgentConversationSession:
             if not label or not value:
                 raise ValueError(f"選項請求的 options[{index}] 缺少 label 或 value。")
             options.append(ChoiceOptionEntry(label=label, value=value, description=description))
+        allow_freeform = self._coerce_bool(event.get("allow_freeform"), default=False)
+        if not options and not allow_freeform:
+            raise ValueError("選項請求至少需要 options 或 allow_freeform=true。")
+        min_values = self._coerce_choice_count(event.get("min_values"), default=1)
+        max_values = self._coerce_choice_count(event.get("max_values"), default=1)
+        if options:
+            max_values = min(max_values, len(options))
+            min_values = min(min_values, max_values)
+        else:
+            min_values = 0
+            max_values = 0
 
-        future: asyncio.Future[dict[str, str]] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending_choice = PendingChoiceState(
             prompt=prompt,
             options=options,
             placeholder=str(event.get("placeholder") or "").strip() or "請選擇一個選項",
             future=future,
+            min_values=min_values,
+            max_values=max_values,
+            allow_freeform=allow_freeform,
+            freeform_placeholder=str(event.get("freeform_placeholder") or "").strip(),
         )
         self._append_conversation("assistant", prompt)
         self._append_activity("等待使用者從選項中做決定。", key="choice")
@@ -493,18 +523,58 @@ class AgentConversationSession:
             self._remove_activity("choice")
             await self.request_render(force=True)
 
-    async def submit_choice(self, value: str) -> None:
+    async def submit_choice(self, values: list[str] | str) -> None:
         if self._pending_choice is None:
             raise ValueError("目前沒有待選項目。")
-        selected = next((option for option in self._pending_choice.options if option.value == value), None)
-        if selected is None:
+        raw_values = [values] if isinstance(values, str) else list(values)
+        normalized_values = [str(value).strip() for value in raw_values if str(value).strip()]
+        value_set = set(normalized_values)
+        selected = [option for option in self._pending_choice.options if option.value in value_set]
+        if not selected:
             raise ValueError("找不到對應的選項。")
-        self._append_conversation("user", selected.label)
+        if len(selected) < self._pending_choice.min_values or len(selected) > self._pending_choice.max_values:
+            raise ValueError("選取項目數量不符合限制。")
+        selected_payload = [{"label": option.label, "value": option.value} for option in selected]
+        self._append_conversation("user", self._format_selected_choice_text(selected))
         if not self._pending_choice.future.done():
-            self._pending_choice.future.set_result({"label": selected.label, "value": selected.value})
+            self._pending_choice.future.set_result(
+                {
+                    "mode": "selection",
+                    "label": selected[0].label,
+                    "value": selected[0].value,
+                    "selections": selected_payload,
+                    "input": "",
+                }
+            )
         await self.bot.log_event(
             "Agent 選項回覆",
-            f"使用者回覆 agent 選項。\nTask ID: {self.task_record.id}\n選項: {self._shorten(selected.label, 150)}",
+            f"使用者回覆 agent 選項。\nTask ID: {self.task_record.id}\n選項: {self._shorten(self._format_selected_choice_text(selected), 150)}",
+            user=self.user,
+            guild=self.guild,
+        )
+
+    async def submit_freeform(self, text: str) -> None:
+        if self._pending_choice is None:
+            raise ValueError("目前沒有待選項目。")
+        if not self._pending_choice.allow_freeform:
+            raise ValueError("目前不接受自由輸入。")
+        normalized = str(text).strip()
+        if not normalized:
+            raise ValueError("自由輸入內容不可為空白。")
+        self._append_conversation("user", normalized)
+        if not self._pending_choice.future.done():
+            self._pending_choice.future.set_result(
+                {
+                    "mode": "freeform",
+                    "label": normalized,
+                    "value": normalized,
+                    "selections": [],
+                    "input": normalized,
+                }
+            )
+        await self.bot.log_event(
+            "Agent 自由輸入回覆",
+            f"使用者以自由輸入回覆 agent。\nTask ID: {self.task_record.id}\n內容: {self._shorten(normalized, 150)}",
             user=self.user,
             guild=self.guild,
         )
@@ -558,6 +628,35 @@ class AgentConversationSession:
             return text
         return text[: limit - 3] + "..."
 
+    def _format_selected_choice_text(self, selected: list[ChoiceOptionEntry]) -> str:
+        return "、".join(option.label for option in selected)
+
+    @staticmethod
+    def _coerce_bool(value: object, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _coerce_choice_count(value: object, *, default: int) -> int:
+        if isinstance(value, bool) or value is None:
+            return default
+        if isinstance(value, int):
+            return max(1, min(value, 25))
+        if isinstance(value, float) and value.is_integer():
+            return max(1, min(int(value), 25))
+        return default
+
 
 class AgentConversationView(discord.ui.LayoutView):
     def __init__(self, session: AgentConversationSession) -> None:
@@ -576,9 +675,11 @@ class AgentConversationView(discord.ui.LayoutView):
         self._after_context_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._choice_select = AgentChoiceSelect(self)
         self._choice_select_row = discord.ui.ActionRow(self._choice_select)
+        self._choice_freeform_button = discord.ui.Button(label="自由輸入", style=discord.ButtonStyle.primary)
+        self._choice_freeform_button.callback = self._on_freeform_choice
         self._choice_cancel_button = discord.ui.Button(label="取消選擇", style=discord.ButtonStyle.secondary)
         self._choice_cancel_button.callback = self._on_cancel_choice
-        self._choice_actions_row = discord.ui.ActionRow(self._choice_cancel_button)
+        self._choice_actions_row = discord.ui.ActionRow(self._choice_freeform_button, self._choice_cancel_button)
         self._interrupt_button = discord.ui.Button(label="中斷", style=discord.ButtonStyle.danger)
         self._interrupt_button.callback = self._on_interrupt
         self._send_message_button = discord.ui.Button(label="傳送訊息", style=discord.ButtonStyle.primary)
@@ -622,8 +723,18 @@ class AgentConversationView(discord.ui.LayoutView):
         self.session._cancel_pending_choice("使用者取消了選項選擇。")
         await self.session.request_render(force=True)
 
+    async def _on_freeform_choice(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.session.user.id:
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            return
+        if self.session._pending_choice is None or not self.session._pending_choice.allow_freeform:
+            await interaction.response.send_message("目前不接受自由輸入。", ephemeral=True)
+            return
+        await interaction.response.send_modal(AgentChoiceFreeformModal(self.session))
+
     def disable_all_items(self) -> None:
         self._choice_select.disabled = True
+        self._choice_freeform_button.disabled = True
         self._choice_cancel_button.disabled = True
         self._interrupt_button.disabled = True
         self._send_message_button.disabled = True
@@ -634,6 +745,9 @@ class AgentConversationView(discord.ui.LayoutView):
             self.disable_all_items()
             return
         self._choice_select.sync_from_session()
+        self._choice_freeform_button.disabled = (
+            self.session._pending_choice is None or not self.session._pending_choice.allow_freeform
+        )
         self._choice_cancel_button.disabled = self.session._pending_choice is None
         self._interrupt_button.disabled = not self.session.is_busy()
 
@@ -645,7 +759,8 @@ class AgentConversationView(discord.ui.LayoutView):
         self._container.add_item(self._after_activity_separator)
         if self.session._pending_choice is not None:
             self._container.add_item(self._choice_display)
-            self._container.add_item(self._choice_select_row)
+            if self.session._pending_choice.options:
+                self._container.add_item(self._choice_select_row)
             self._container.add_item(self._choice_actions_row)
             self._container.add_item(self._after_choice_separator)
         if self.session.task_items:
@@ -686,17 +801,28 @@ class AgentChoiceSelect(discord.ui.Select):
             await interaction.response.send_message("目前沒有待選項目。", ephemeral=True)
             return
         await interaction.response.defer()
-        await self.parent_view.session.submit_choice(self.values[0])
+        await self.parent_view.session.submit_choice(list(self.values))
 
     def sync_from_session(self) -> None:
         pending_choice = self.parent_view.session._pending_choice
         if pending_choice is None:
             self.disabled = True
             self.placeholder = "目前沒有待選項目"
+            self.min_values = 1
+            self.max_values = 1
             self.options = [discord.SelectOption(label="目前沒有待選項目", value="__none__")]
+            return
+        if not pending_choice.options:
+            self.disabled = True
+            self.placeholder = "請改用自由輸入"
+            self.min_values = 1
+            self.max_values = 1
+            self.options = [discord.SelectOption(label="請改用自由輸入", value="__freeform__")]
             return
         self.disabled = False
         self.placeholder = pending_choice.placeholder
+        self.min_values = max(1, pending_choice.min_values)
+        self.max_values = max(self.min_values, pending_choice.max_values)
         self.options = [
             discord.SelectOption(
                 label=self.parent_view.session._shorten(option.label, 100),
@@ -705,6 +831,27 @@ class AgentChoiceSelect(discord.ui.Select):
             )
             for option in pending_choice.options[:25]
         ]
+
+
+class AgentChoiceFreeformModal(discord.ui.Modal):
+    def __init__(self, session: AgentConversationSession) -> None:
+        super().__init__(title="自由輸入回覆")
+        self.session = session
+        pending_choice = session._pending_choice
+        placeholder = "輸入選項外的補充、答案或偏好..."
+        if pending_choice is not None and pending_choice.freeform_placeholder:
+            placeholder = pending_choice.freeform_placeholder
+        self.response_input = discord.ui.TextInput(
+            label="回覆內容",
+            placeholder=placeholder,
+            style=discord.TextStyle.paragraph,
+            max_length=1500,
+        )
+        self.add_item(self.response_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        await self.session.submit_freeform(str(self.response_input))
 
 
 class AgentMessageModal(discord.ui.Modal):

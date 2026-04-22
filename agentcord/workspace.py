@@ -113,6 +113,11 @@ class WorkspaceManager:
         absolute = self._resolve_path(user_id, path)
         if not absolute.exists():
             raise WorkspaceError(f"找不到路徑：{path}")
+        current_total = self.total_size(user_id)
+        if current_total > self._limit_bytes:
+            raise WorkspaceError(
+                f"同步遭拒：工作區目前大小 {current_total} 位元組，已超過 {self._limit_bytes} 位元組上限。"
+            )
 
         source_root = absolute if absolute.is_dir() else absolute.parent
         active_patterns = self._build_ignore_pattern_set(ignore_patterns)
@@ -146,6 +151,8 @@ class WorkspaceManager:
 
         return {
             "source_path": self._to_relative(user_id, absolute),
+            "total_size": current_total,
+            "limit_bytes": self._limit_bytes,
             "files": files,
             "skipped": skipped,
             "ignore_patterns": sorted(active_patterns),
