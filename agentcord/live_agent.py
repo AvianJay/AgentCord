@@ -330,34 +330,22 @@ class AgentConversationSession:
                 await self.request_render(force=True)
 
     def render_content(self) -> str:
-        return self._render_conversation_display()
+        return self._render_main_display()
 
-    def _render_conversation_display(self) -> str:
-        conversation_lines = [self._format_conversation_entry(entry) for entry in self._conversation_entries] or ["(無)"]
-        content = self._compose_conversation_display(conversation_lines)
-        while len(content) > _MESSAGE_LIMIT and len(conversation_lines) > 1:
-            conversation_lines = conversation_lines[1:]
-            content = self._compose_conversation_display(conversation_lines)
-        if len(content) > _MESSAGE_LIMIT:
-            return content[: _MESSAGE_LIMIT - 3] + "..."
-        return content
-
-    def _compose_conversation_display(self, conversation_lines: list[str]) -> str:
-        return "\n".join(["## 對話", *conversation_lines])
-
-    def _render_activity_display(self) -> str:
+    def _render_main_display(self) -> str:
+        conversation_lines = [self._format_conversation_entry(entry) for entry in self._conversation_entries]
         activity_lines = [f"-# {entry.text}" for entry in self._activity_lines] or ["-# 等待新的 agent 訊息。"]
-        content = self._compose_activity_display(activity_lines)
-        while len(content) > _MESSAGE_LIMIT and len(activity_lines) > 1:
-            activity_lines = activity_lines[1:]
-            content = self._compose_activity_display(activity_lines)
+        lines = [*conversation_lines, *activity_lines] or ["(無)"]
+        content = self._compose_main_display(lines)
+        while len(content) > _MESSAGE_LIMIT and len(lines) > 1:
+            lines = lines[1:]
+            content = self._compose_main_display(lines)
         if len(content) > _MESSAGE_LIMIT:
             return content[: _MESSAGE_LIMIT - 3] + "..."
         return content
 
-    def _compose_activity_display(self, activity_lines: list[str]) -> str:
-        parts = ["## AI 在幹什麼", *activity_lines]
-        return "\n".join(parts)
+    def _compose_main_display(self, lines: list[str]) -> str:
+        return "\n".join(lines)
 
     def _render_choice_block(self) -> str:
         if self._pending_choice is None:
@@ -662,14 +650,12 @@ class AgentConversationView(discord.ui.LayoutView):
     def __init__(self, session: AgentConversationSession) -> None:
         super().__init__(timeout=None)
         self.session = session
-        self._conversation_display = discord.ui.TextDisplay("## 對話\n(無)")
-        self._activity_display = discord.ui.TextDisplay("## AI 在幹什麼\n-# 等待新的 agent 訊息。")
+        self._main_display = discord.ui.TextDisplay("-# 等待新的 agent 訊息。")
         self._choice_display = discord.ui.TextDisplay("## 請選擇\n(目前沒有待選項目)")
         self._tasks_display = discord.ui.TextDisplay("## 待辦事項\n(無)")
         self._context_display = discord.ui.TextDisplay("-# (未設定)")
         self._operations_display = discord.ui.TextDisplay("-# #0")
-        self._after_conversation_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
-        self._after_activity_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
+        self._after_main_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._after_choice_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._after_tasks_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._after_context_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
@@ -753,10 +739,8 @@ class AgentConversationView(discord.ui.LayoutView):
 
     def _rebuild_container(self) -> None:
         self._container.clear_items()
-        self._container.add_item(self._conversation_display)
-        self._container.add_item(self._after_conversation_separator)
-        self._container.add_item(self._activity_display)
-        self._container.add_item(self._after_activity_separator)
+        self._container.add_item(self._main_display)
+        self._container.add_item(self._after_main_separator)
         if self.session._pending_choice is not None:
             self._container.add_item(self._choice_display)
             if self.session._pending_choice.options:
@@ -772,8 +756,7 @@ class AgentConversationView(discord.ui.LayoutView):
         self._container.add_item(self._actions_row)
 
     def sync_layout(self) -> None:
-        self._conversation_display.content = self.session._render_conversation_display()
-        self._activity_display.content = self.session._render_activity_display()
+        self._main_display.content = self.session._render_main_display()
         self._choice_display.content = self.session._render_choice_block()
         self._tasks_display.content = self.session._render_tasks_block()
         self._context_display.content = self.session._render_context_block()
