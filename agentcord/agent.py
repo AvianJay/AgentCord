@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -10,6 +11,18 @@ from agentcord.ai import PollinationsProvider, create_provider, parse_json_objec
 from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.models import AIUsage, AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
+from agentcord.pterodactyl import (
+    create_pterodactyl_server_folder,
+    get_pterodactyl_startup,
+    join_pterodactyl_server_path,
+    read_pterodactyl_console,
+    read_pterodactyl_server_file,
+    request_pterodactyl_client_api,
+    send_pterodactyl_console_command,
+    set_pterodactyl_power_state,
+    update_pterodactyl_startup_variable,
+    write_pterodactyl_server_file,
+)
 from agentcord.workspace import WorkspaceError, WorkspaceManager
 
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -396,11 +409,14 @@ class CodingAgent:
         history_messages: list[ConversationMessage],
         current_task_items: list[AgentTaskItem],
     ) -> str:
+        pterodactyl_config = self.db.get_pterodactyl_config(user_id)
+        pterodactyl_status = pterodactyl_config.base_url if pterodactyl_config.base_url and pterodactyl_config.api_key else "未設定"
         return (
             f"使用者需求：\n{prompt}\n\n"
             f"對話歷史：\n{self._render_conversation_history(history_messages)}\n\n"
             f"目前計畫：\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
             f"目前 tasks：\n{json.dumps([{"title": item.title, "status": item.status} for item in current_task_items], ensure_ascii=False, indent=2)}\n\n"
+            f"Pterodactyl Client API：{pterodactyl_status}\n\n"
             f"工作區樹狀內容：\n{self.workspace.dump_tree(user_id)}\n\n"
             f"先前工具紀錄：\n{json.dumps(transcript[-6:], ensure_ascii=False, indent=2)}\n\n"
             "請回傳 JSON，必須包含 summary、done、related_files、actions 這些鍵。"
@@ -529,6 +545,168 @@ class CodingAgent:
                     "required": ["url"],
                 },
                 handler_name="_tool_fetch_url",
+            ),
+            AgentToolSpec(
+                name="sleep",
+                description="等待指定秒數，讓外部系統有時間完成狀態變更或輸出新內容。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "seconds": {"type": "number", "description": "等待秒數，建議 1 到 30 秒。"},
+                    },
+                    "required": ["seconds"],
+                },
+                handler_name="_tool_sleep",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_read_startup",
+                description="讀取指定伺服器的 startup 設定與可編輯環境變數。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                    },
+                    "required": ["server"],
+                },
+                handler_name="_tool_pterodactyl_read_startup",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_set_startup_variable",
+                description="更新指定伺服器的單一 startup 環境變數。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                        "key": {"type": "string", "description": "環境變數名稱。"},
+                        "value": {"type": "string", "description": "要設定的新值。"},
+                    },
+                    "required": ["server", "key", "value"],
+                },
+                handler_name="_tool_pterodactyl_set_startup_variable",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_power_action",
+                description="對指定伺服器執行 start、stop、restart 或 kill。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                        "signal": {
+                            "type": "string",
+                            "description": "電源操作。",
+                            "enum": ["start", "stop", "restart", "kill"],
+                        },
+                    },
+                    "required": ["server", "signal"],
+                },
+                handler_name="_tool_pterodactyl_power_action",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_send_command",
+                description="對指定伺服器送出一條 console 指令。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                        "command": {"type": "string", "description": "要送出的 console 指令。"},
+                    },
+                    "required": ["server", "command"],
+                },
+                handler_name="_tool_pterodactyl_send_command",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_read_console",
+                description=(
+                    "透過 websocket 讀取指定伺服器目前開始往後的 live console 輸出。"
+                    "若要觀察啟動過程，請在 power_action 後立刻呼叫。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                        "wait_seconds": {"type": "number", "description": "監聽秒數，1 到 30。"},
+                        "max_lines": {"type": "integer", "description": "最多保留幾行 console 輸出，預設 80。"},
+                    },
+                    "required": ["server"],
+                },
+                handler_name="_tool_pterodactyl_read_console",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_read_server_file",
+                description="讀取指定伺服器上的純文字檔內容。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                        "path": {"type": "string", "description": "伺服器上的檔案路徑。"},
+                    },
+                    "required": ["server", "path"],
+                },
+                handler_name="_tool_pterodactyl_read_server_file",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_write_server_file",
+                description="以純文字內容覆寫指定伺服器上的檔案。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                        "path": {"type": "string", "description": "伺服器上的檔案路徑。"},
+                        "content": {"type": "string", "description": "要寫入的 UTF-8 文字內容。"},
+                    },
+                    "required": ["server", "path", "content"],
+                },
+                handler_name="_tool_pterodactyl_write_server_file",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_sync_workspace",
+                description=(
+                    "把目前 agent 工作區中的文字檔同步到指定伺服器路徑。"
+                    "會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄，"
+                    "也可以額外提供 ignore_patterns。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "server": {"type": "string", "description": "Pterodactyl server identifier。"},
+                        "path": {"type": "string", "description": "工作區內要同步的來源路徑，預設為 .。"},
+                        "remote_path": {"type": "string", "description": "伺服器上的目標資料夾，預設為 /。"},
+                        "ignore_patterns": {
+                            "type": "array",
+                            "description": "額外忽略規則，例如 ['coverage', '*.log']。",
+                            "items": {"type": "string"},
+                        },
+                        "dry_run": {"type": "boolean", "description": "若為 true，只回傳預計同步結果，不實際上傳。"},
+                    },
+                    "required": ["server"],
+                },
+                handler_name="_tool_pterodactyl_sync_workspace",
+            ),
+            AgentToolSpec(
+                name="pterodactyl_request",
+                description=(
+                    "呼叫目前使用者已設定好的 Pterodactyl Client API。"
+                    "path 必須是相對於 /api/client 的路徑，例如 /account、/servers/{server}、/servers/{server}/resources、"
+                    "/servers/{server}/command。若要列出伺服器，請使用 GET 並將 path 設為 /。"
+                    "若要讀取伺服器檔案內容，可使用 GET /servers/{server}/files/contents，"
+                    "並在 query 提供 {\"file\": \"/path/to/file\"}，expect 設為 text。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "method": {"type": "string", "description": "HTTP 方法：GET、POST、PUT、PATCH、DELETE。"},
+                        "path": {"type": "string", "description": "相對於 /api/client 的路徑；根路徑請填 /。"},
+                        "query": {"type": "object", "description": "可選查詢參數 JSON 物件。"},
+                        "body": {"type": "object", "description": "可選 JSON request body。"},
+                        "expect": {
+                            "type": "string",
+                            "description": "回應解析模式：auto、json、text。預設 auto。",
+                            "enum": ["auto", "json", "text"],
+                        },
+                    },
+                    "required": ["method", "path"],
+                },
+                handler_name="_tool_pterodactyl_request",
             ),
             AgentToolSpec(
                 name="tasks",
@@ -864,6 +1042,260 @@ class CodingAgent:
         outcome = await self._fetch_url(user_id, url)
         return ({"url": url, "result": outcome}, [], current_task_items)
 
+    async def _tool_sleep(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del user_id, progress_callback
+        seconds = self._require_number_argument(action, "seconds", minimum=0.1, maximum=30.0)
+        await asyncio.sleep(seconds)
+        return ({"slept_seconds": seconds}, [], current_task_items)
+
+    async def _tool_pterodactyl_read_startup(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        result = await get_pterodactyl_startup(self.session, self.db.get_pterodactyl_config(user_id), server)
+        return ({"server": server, "result": result}, [], current_task_items)
+
+    async def _tool_pterodactyl_set_startup_variable(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        key = self._require_string_argument(action, "key")
+        value = self._require_string_argument(action, "value", allow_empty=True)
+        result = await update_pterodactyl_startup_variable(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+            server,
+            key,
+            value,
+        )
+        return ({"server": server, "key": key, "result": result}, [], current_task_items)
+
+    async def _tool_pterodactyl_power_action(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        signal = self._require_string_argument(action, "signal")
+        await set_pterodactyl_power_state(self.session, self.settings, self.db.get_pterodactyl_config(user_id), server, signal)
+        return ({"server": server, "signal": signal, "result": "ok"}, [], current_task_items)
+
+    async def _tool_pterodactyl_send_command(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        command = self._require_string_argument(action, "command")
+        await send_pterodactyl_console_command(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+            server,
+            command,
+        )
+        return ({"server": server, "command": command, "result": "ok"}, [], current_task_items)
+
+    async def _tool_pterodactyl_read_console(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        wait_seconds = float(action.get("wait_seconds") or 5.0)
+        max_lines = int(action.get("max_lines") or 80)
+        result = await read_pterodactyl_console(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+            server,
+            wait_seconds=wait_seconds,
+            max_lines=max_lines,
+        )
+        return ({"server": server, "wait_seconds": wait_seconds, "result": result}, [], current_task_items)
+
+    async def _tool_pterodactyl_read_server_file(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        path = self._require_string_argument(action, "path")
+        result = await read_pterodactyl_server_file(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+            server,
+            path,
+        )
+        return ({"server": server, "path": path, "result": result}, [], current_task_items)
+
+    async def _tool_pterodactyl_write_server_file(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        path = self._require_string_argument(action, "path")
+        content = self._require_string_argument(action, "content", allow_empty=True)
+        await write_pterodactyl_server_file(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+            server,
+            path,
+            content,
+        )
+        return ({"server": server, "path": path, "result": "ok"}, [], current_task_items)
+
+    async def _tool_pterodactyl_sync_workspace(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        server = self._require_string_argument(action, "server")
+        source_path = str(action.get("path") or ".").strip() or "."
+        remote_path = str(action.get("remote_path") or "/").strip() or "/"
+        dry_run = self._coerce_bool(action.get("dry_run"), default=False)
+        ignore_patterns = self._optional_string_list_argument(action, "ignore_patterns")
+        manifest = self.workspace.collect_sync_candidates(
+            user_id,
+            source_path,
+            ignore_patterns=ignore_patterns,
+        )
+
+        files = [item for item in manifest["files"] if isinstance(item, dict)]
+        synced_preview: list[dict[str, Any]] = []
+        config = self.db.get_pterodactyl_config(user_id)
+        remote_directories = sorted(
+            {
+                join_pterodactyl_server_path(remote_path, item["relative_path"].rsplit("/", 1)[0])
+                for item in files
+                if isinstance(item.get("relative_path"), str) and "/" in item["relative_path"]
+            },
+            key=lambda value: (value.count("/"), value),
+        )
+        if not dry_run:
+            for directory in remote_directories:
+                await create_pterodactyl_server_folder(self.session, self.settings, config, server, directory)
+            for item in files:
+                workspace_path = str(item["workspace_path"])
+                relative_path = str(item["relative_path"])
+                remote_file_path = join_pterodactyl_server_path(remote_path, relative_path)
+                content = self.workspace.read_file(user_id, workspace_path)
+                await write_pterodactyl_server_file(
+                    self.session,
+                    self.settings,
+                    config,
+                    server,
+                    remote_file_path,
+                    content,
+                )
+                if len(synced_preview) < 50:
+                    synced_preview.append(
+                        {
+                            "workspace_path": workspace_path,
+                            "remote_path": remote_file_path,
+                            "size": item.get("size", 0),
+                        }
+                    )
+        return (
+            {
+                "server": server,
+                "source_path": manifest["source_path"],
+                "remote_path": remote_path,
+                "dry_run": dry_run,
+                "ignore_patterns": manifest["ignore_patterns"],
+                "file_count": len(files),
+                "skipped_count": len(manifest["skipped"]),
+                "files_preview": [
+                    {
+                        "workspace_path": str(item["workspace_path"]),
+                        "relative_path": str(item["relative_path"]),
+                        "size": item.get("size", 0),
+                    }
+                    for item in files[:50]
+                ]
+                if dry_run
+                else synced_preview,
+                "skipped_preview": manifest["skipped"][:50],
+            },
+            [],
+            current_task_items,
+        )
+
+    async def _tool_pterodactyl_request(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        method = self._require_string_argument(action, "method")
+        raw_path = action.get("path")
+        if not isinstance(raw_path, str):
+            raise ValueError(f"工具 {action.get('tool')} 缺少字串參數：path。")
+        path = raw_path.strip() or "/"
+        query = self._optional_object_argument(action, "query") or {}
+        body = self._optional_object_argument(action, "body")
+        expect = str(action.get("expect") or "auto").strip().lower() or "auto"
+        response = await request_pterodactyl_client_api(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+            method,
+            path,
+            query=query,
+            body=body,
+            expect=expect,
+        )
+        return (
+            {
+                "method": method.upper(),
+                "path": path,
+                "status": response.status,
+                "result": response.data,
+            },
+            [],
+            current_task_items,
+        )
+
     async def _tool_tasks(
         self,
         user_id: int,
@@ -901,6 +1333,47 @@ class CodingAgent:
         if not allow_empty and not value.strip():
             raise ValueError(f"工具 {action.get('tool')} 缺少字串參數：{key}。")
         return value if allow_empty else value.strip()
+
+    def _optional_object_argument(self, action: dict[str, Any], key: str) -> dict[str, Any] | None:
+        value = action.get(key)
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        raise ValueError(f"工具 {action.get('tool')} 的 {key} 參數必須是 JSON 物件。")
+
+    def _optional_string_list_argument(self, action: dict[str, Any], key: str) -> list[str] | None:
+        value = action.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError(f"工具 {action.get('tool')} 的 {key} 參數必須是字串陣列。")
+        result: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError(f"工具 {action.get('tool')} 的 {key} 參數必須是字串陣列。")
+            normalized = item.strip()
+            if normalized:
+                result.append(normalized)
+        return result
+
+    def _require_number_argument(
+        self,
+        action: dict[str, Any],
+        key: str,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+    ) -> float:
+        value = action.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"工具 {action.get('tool')} 缺少數值參數：{key}。")
+        number = float(value)
+        if minimum is not None and number < minimum:
+            raise ValueError(f"工具 {action.get('tool')} 的 {key} 不能小於 {minimum}。")
+        if maximum is not None and number > maximum:
+            raise ValueError(f"工具 {action.get('tool')} 的 {key} 不能大於 {maximum}。")
+        return number
 
     @staticmethod
     def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -1080,6 +1553,16 @@ class CodingAgent:
             "py_compile_check": "語法檢查",
             "search_web": "搜尋網路",
             "fetch_url": "抓取網址",
+            "sleep": "等待",
+            "pterodactyl_read_startup": "讀取 startup",
+            "pterodactyl_set_startup_variable": "更新 startup 變數",
+            "pterodactyl_power_action": "伺服器電源操作",
+            "pterodactyl_send_command": "送出 console 指令",
+            "pterodactyl_read_console": "讀取 console",
+            "pterodactyl_read_server_file": "讀取伺服器檔案",
+            "pterodactyl_write_server_file": "寫入伺服器檔案",
+            "pterodactyl_sync_workspace": "同步工作區到伺服器",
+            "pterodactyl_request": "Pterodactyl API 請求",
             "tasks": "更新 tasks 清單",
         }
         normalized = self._normalize_tool_name(tool_name)
@@ -1107,6 +1590,26 @@ class CodingAgent:
             return f"搜尋網路中：{action.get('query', '')}"
         if tool_name == "fetch_url":
             return f"抓取網址中：{action.get('url', '')}"
+        if tool_name == "sleep":
+            return f"等待中：{action.get('seconds', '')} 秒"
+        if tool_name == "pterodactyl_read_startup":
+            return f"讀取 startup 中：{action.get('server', '')}"
+        if tool_name == "pterodactyl_set_startup_variable":
+            return f"更新 startup 變數中：{action.get('server', '')} {action.get('key', '')}"
+        if tool_name == "pterodactyl_power_action":
+            return f"伺服器電源操作中：{action.get('server', '')} {action.get('signal', '')}"
+        if tool_name == "pterodactyl_send_command":
+            return f"送出 console 指令中：{action.get('server', '')}"
+        if tool_name == "pterodactyl_read_console":
+            return f"讀取 console 中：{action.get('server', '')}"
+        if tool_name == "pterodactyl_read_server_file":
+            return f"讀取伺服器檔案中：{action.get('server', '')} {action.get('path', '')}"
+        if tool_name == "pterodactyl_write_server_file":
+            return f"寫入伺服器檔案中：{action.get('server', '')} {action.get('path', '')}"
+        if tool_name == "pterodactyl_sync_workspace":
+            return f"同步工作區到伺服器中：{action.get('server', '')} {action.get('remote_path', '/') }"
+        if tool_name == "pterodactyl_request":
+            return f"Pterodactyl API 請求中：{str(action.get('method', '')).upper()} {action.get('path', '/') }"
         if tool_name == "tasks":
             return "更新 tasks 清單中。"
         return f"執行工具中：{tool_name}"
@@ -1121,6 +1624,22 @@ class CodingAgent:
             return "搜尋網路已完成。"
         if tool_name == "fetch_url":
             return "抓取網址已完成。"
+        if tool_name == "sleep":
+            return "等待已完成。"
+        if tool_name in {
+            "pterodactyl_read_startup",
+            "pterodactyl_set_startup_variable",
+            "pterodactyl_power_action",
+            "pterodactyl_send_command",
+            "pterodactyl_read_console",
+            "pterodactyl_read_server_file",
+            "pterodactyl_write_server_file",
+        }:
+            return f"{self._format_tool_label(tool_name)}已完成：{action.get('server', '')}"
+        if tool_name == "pterodactyl_sync_workspace":
+            return f"同步工作區到伺服器已完成：{action.get('server', '')}"
+        if tool_name == "pterodactyl_request":
+            return f"Pterodactyl API 請求已完成：{str(action.get('method', '')).upper()} {action.get('path', '/') }"
         if tool_name == "apply_patch":
             return "套用 patch 已完成。"
         if tool_name == "tasks":
@@ -1200,5 +1719,8 @@ _AGENT_SYSTEM_PROMPT_PREFIX = """
 - 只回傳合法 JSON。
 - summary 與 related_files 內容請使用繁體中文。
 - fetch_url 可直接抓取公開網址內容；若設定了 PROXY_* 環境變數，會透過 proxy 抓取，不需要先經過 search_web。
+- 若使用者已透過 /set-pterodactyl 設定 Pterodactyl Client API，可使用 pterodactyl_request 查詢或操作其有權限的伺服器資源。
+- pterodactyl_sync_workspace 會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄；如有需要可額外提供 ignore_patterns。
+- pterodactyl_read_console 只能擷取建立連線後的 live 輸出；若要觀察啟動過程，請在 power_action 後立刻呼叫，必要時再搭配 sleep。
 - 如果目前工作有明確步驟，請使用 tasks 工具更新工作清單，好讓使用者看到目前進度。
 """

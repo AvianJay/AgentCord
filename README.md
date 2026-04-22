@@ -13,11 +13,13 @@ AI-powered coding agent bot for Discord, built with `discord.py`.
   - path traversal protection
 - Credits system with one-time default balance and owner overrides
 - Pollinations as the default AI provider with per-user model switching
+- Per-user Pterodactyl Client API credentials for agent-side server operations
 - External providers for OpenAI, Anthropic, Google, xAI, and OpenAI-compatible custom endpoints
 - Task tracking for agent runs
 - Markdown memory notes stored in the workspace
 - Web search via Pollinations `gemini-search` and direct webpage fetching through optional `PROXY_*` settings
 - Zip export and import for workspace projects
+- Pterodactyl-aware agent tools for startup config, power control, console reading, server file editing, and workspace-to-server sync
 
 ## Requirements
 
@@ -59,3 +61,5 @@ python main.py
 - Existing file edits are designed to prefer unified diff patches over full overwrites during agent runs.
 - `/import-zip` only accepts valid zip archives containing UTF-8 text files and rejects path traversal entries.
 - When `DISCORD_LOG_WEBHOOK` is set, command usage, agent session actions, and execution errors are queued and sent to the webhook in embed batches.
+- `/set-pterodactyl` validates the provided panel URL and Client API key against `GET /api/client/account` before saving them for the current user.
+- Agent workspace tree and Pterodactyl sync automatically ignore bulky generated directories such as `.venv`, `venv`, `node_modules`, and `__pycache__`, while still showing those directories at the tree level so the model can decide whether to add more ignore rules.

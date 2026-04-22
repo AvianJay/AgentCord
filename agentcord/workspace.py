@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import py_compile
@@ -8,6 +9,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -21,6 +23,32 @@ class WorkspaceError(ValueError):
     """Raised for invalid workspace operations."""
 
 
+_DEFAULT_SYNC_IGNORE_PATTERNS = (
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".parcel-cache",
+    ".cache",
+    "dist",
+    "build",
+    "*.pyc",
+    "*.pyo",
+)
+
+
 class WorkspaceManager:
     def __init__(self, base_dir: Path, limit_bytes: int) -> None:
         self._base_dir = base_dir
@@ -28,7 +56,7 @@ class WorkspaceManager:
         self._base_dir.mkdir(parents=True, exist_ok=True)
 
     def user_root(self, user_id: int) -> Path:
-        root = self._base_dir / str(user_id)
+        root = (self._base_dir / str(user_id)).resolve()
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -71,6 +99,57 @@ class WorkspaceManager:
             size = 0 if child.is_dir() else child.stat().st_size
             entries.append(WorkspaceEntry(path=rel, kind=kind, size=size))
         return entries
+
+    def default_sync_ignore_patterns(self) -> list[str]:
+        return list(_DEFAULT_SYNC_IGNORE_PATTERNS)
+
+    def collect_sync_candidates(
+        self,
+        user_id: int,
+        path: str = ".",
+        *,
+        ignore_patterns: list[str] | None = None,
+    ) -> dict[str, Any]:
+        absolute = self._resolve_path(user_id, path)
+        if not absolute.exists():
+            raise WorkspaceError(f"找不到路徑：{path}")
+
+        source_root = absolute if absolute.is_dir() else absolute.parent
+        active_patterns = self._build_ignore_pattern_set(ignore_patterns)
+        files: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+
+        def visit(current: Path) -> None:
+            workspace_path = self._to_relative(user_id, current)
+            sync_path = current.relative_to(source_root).as_posix() if current != source_root else "."
+            is_dir = current.is_dir()
+            if self._should_ignore_sync_path(workspace_path, sync_path, is_dir=is_dir, ignore_patterns=active_patterns):
+                skipped.append({"path": workspace_path, "reason": "ignored"})
+                return
+            if is_dir:
+                for child in sorted(current.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
+                    visit(child)
+                return
+            files.append(
+                {
+                    "workspace_path": workspace_path,
+                    "relative_path": sync_path,
+                    "size": current.stat().st_size,
+                }
+            )
+
+        if absolute.is_dir():
+            for child in sorted(absolute.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
+                visit(child)
+        else:
+            visit(absolute)
+
+        return {
+            "source_path": self._to_relative(user_id, absolute),
+            "files": files,
+            "skipped": skipped,
+            "ignore_patterns": sorted(active_patterns),
+        }
 
     def delete_file(self, user_id: int, path: str) -> None:
         absolute = self._resolve_path(user_id, path)
@@ -353,13 +432,89 @@ class WorkspaceManager:
 
     def dump_tree(self, user_id: int) -> str:
         root = self.user_root(user_id)
-        items: list[dict[str, str | int]] = []
-        for path in sorted(root.rglob("*")):
-            if path.is_file():
+        items: list[dict[str, Any]] = []
+        ignore_patterns = self._build_ignore_pattern_set(None)
+        max_depth = 5
+        max_entries = 500
+        truncated = False
+
+        def visit(directory: Path, depth: int) -> None:
+            nonlocal truncated
+            for child in sorted(directory.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
+                if len(items) >= max_entries:
+                    truncated = True
+                    return
+                relative_path = child.relative_to(root).as_posix()
+                is_dir = child.is_dir()
+                if self._should_ignore_sync_path(relative_path, relative_path, is_dir=is_dir, ignore_patterns=ignore_patterns):
+                    items.append(
+                        {
+                            "path": relative_path,
+                            "kind": "folder" if is_dir else "file",
+                            "ignored": True,
+                        }
+                    )
+                    continue
+                if is_dir:
+                    entry: dict[str, Any] = {"path": relative_path, "kind": "folder"}
+                    if depth >= max_depth:
+                        entry["truncated"] = True
+                        items.append(entry)
+                        continue
+                    items.append(entry)
+                    visit(child, depth + 1)
+                    continue
                 items.append(
                     {
-                        "path": path.relative_to(root).as_posix(),
-                        "size": path.stat().st_size,
+                        "path": relative_path,
+                        "kind": "file",
+                        "size": child.stat().st_size,
                     }
                 )
+
+        visit(root, 0)
+        if truncated:
+            items.append(
+                {
+                    "path": "...",
+                    "kind": "meta",
+                    "truncated": True,
+                    "reason": f"僅顯示前 {max_entries} 個項目。",
+                }
+            )
         return json.dumps(items, ensure_ascii=False, indent=2)
+
+    def _build_ignore_pattern_set(self, extra_patterns: list[str] | None) -> set[str]:
+        patterns = {
+            pattern.strip().replace("\\", "/").lower()
+            for pattern in _DEFAULT_SYNC_IGNORE_PATTERNS
+            if pattern.strip()
+        }
+        for pattern in extra_patterns or []:
+            normalized = str(pattern).strip().replace("\\", "/").lower()
+            if normalized:
+                patterns.add(normalized)
+        return patterns
+
+    def _should_ignore_sync_path(
+        self,
+        workspace_path: str,
+        sync_path: str,
+        *,
+        is_dir: bool,
+        ignore_patterns: set[str],
+    ) -> bool:
+        candidates = {
+            workspace_path.strip("/").lower(),
+            sync_path.strip("/").lower(),
+        }
+        candidates = {candidate for candidate in candidates if candidate and candidate != "."}
+        names = {PurePosixPath(candidate).name for candidate in candidates}
+        for pattern in ignore_patterns:
+            if any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates):
+                return True
+            if any(fnmatch.fnmatch(name, pattern) for name in names):
+                return True
+            if is_dir and any(fnmatch.fnmatch(f"{candidate}/", pattern.rstrip("/") + "/") for candidate in candidates):
+                return True
+        return False

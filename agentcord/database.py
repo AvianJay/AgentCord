@@ -5,7 +5,15 @@ import sqlite3
 import time
 from pathlib import Path
 
-from agentcord.models import AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig
+from agentcord.models import (
+    AgentTaskItem,
+    ConversationMessage,
+    Provider,
+    TaskRecord,
+    TaskStatus,
+    UserModelConfig,
+    UserPterodactylConfig,
+)
 
 
 class Database:
@@ -34,6 +42,12 @@ class Database:
                     provider TEXT NOT NULL,
                     api_key TEXT NOT NULL,
                     model TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS pterodactyl_configs (
+                    user_id INTEGER PRIMARY KEY,
+                    base_url TEXT NOT NULL,
+                    api_key TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -150,6 +164,33 @@ class Database:
                     model = excluded.model
                 """,
                 (user_id, config.provider.value, config.api_key, config.model),
+            )
+
+    def get_pterodactyl_config(self, user_id: int) -> UserPterodactylConfig:
+        self.ensure_user(user_id)
+        row = self._connection.execute(
+            "SELECT base_url, api_key FROM pterodactyl_configs WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return UserPterodactylConfig()
+        return UserPterodactylConfig(
+            base_url=row["base_url"],
+            api_key=row["api_key"],
+        )
+
+    def set_pterodactyl_config(self, user_id: int, config: UserPterodactylConfig) -> None:
+        self.ensure_user(user_id)
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO pterodactyl_configs (user_id, base_url, api_key)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    base_url = excluded.base_url,
+                    api_key = excluded.api_key
+                """,
+                (user_id, config.base_url, config.api_key),
             )
 
     def create_task(

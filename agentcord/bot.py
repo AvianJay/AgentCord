@@ -16,7 +16,8 @@ from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.logger import DiscordWebhookLogger
 from agentcord.live_agent import AgentConversationSession
-from agentcord.models import Provider, TaskRecord, TaskStatus, UserModelConfig
+from agentcord.models import Provider, TaskRecord, TaskStatus, UserModelConfig, UserPterodactylConfig
+from agentcord.pterodactyl import fetch_pterodactyl_account
 from agentcord.workspace import WorkspaceError, WorkspaceManager
 
 
@@ -28,6 +29,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "agent-history": "代理歷史",
     "agent-open": "開啟代理對話",
     "set-model": "設定模型",
+    "set-pterodactyl": "設定翼龍",
     "custom-model": "自訂模型",
     "file-manager": "檔案管理",
     "list": "列表",
@@ -42,6 +44,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "model": "模型",
     "provider": "供應商",
     "api_key": "金鑰",
+    "base_url": "API網址",
     "archive": "壓縮檔",
     "force": "強制",
     "path": "路徑",
@@ -420,6 +423,40 @@ def register_commands(bot: AgentCordBot) -> None:
             f"模型已設定為 Pollinations/{model}。", ephemeral=True
         )
 
+    @bot.tree.command(name="set-pterodactyl", description="設定你的 Pterodactyl Client API。")
+    @app_commands.describe(
+        base_url="Pterodactyl 面板網址，或完整的 /api/client 網址。",
+        api_key="Pterodactyl Client API 金鑰。",
+    )
+    async def set_pterodactyl(interaction: discord.Interaction, base_url: str, api_key: str) -> None:
+        assert bot.http_session is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        config, account = await fetch_pterodactyl_account(bot.http_session, bot.settings, base_url, api_key)
+        bot.db.set_pterodactyl_config(
+            interaction.user.id,
+            UserPterodactylConfig(base_url=config.base_url, api_key=config.api_key),
+        )
+
+        attributes = account.get("attributes", {}) if isinstance(account, dict) else {}
+        username = str(attributes.get("username") or "").strip()
+        email = str(attributes.get("email") or "").strip()
+        account_label = username or email or "已通過驗證"
+        if username and email:
+            account_label = f"{username} ({email})"
+
+        await log_interaction(
+            interaction,
+            "更新 Pterodactyl API 設定。",
+            fields=[
+                ("API URL", config.base_url, False),
+                ("帳號", account_label, False),
+            ],
+        )
+        await interaction.followup.send(
+            f"Pterodactyl Client API 已設定完成。驗證帳號：{account_label}\nAPI URL：{config.base_url}",
+            ephemeral=True,
+        )
+
     @set_model.autocomplete("model")
     async def set_model_autocomplete(
         interaction: discord.Interaction,
@@ -653,6 +690,7 @@ def register_commands(bot: AgentCordBot) -> None:
     @agent_history.error
     @agent_open.error
     @set_model.error
+    @set_pterodactyl.error
     @custom_model.error
     @file_list.error
     @file_read.error

@@ -30,6 +30,12 @@ class UserModelConfig:
 
 
 @dataclass(slots=True)
+class UserPterodactylConfig:
+    base_url: str = ""
+    api_key: str = ""
+
+
+@dataclass(slots=True)
 class ConversationMessage:
     role: str
     content: str
