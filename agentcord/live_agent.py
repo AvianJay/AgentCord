@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from agentcord.models import AgentTaskItem, TaskRecord, TaskStatus
+from agentcord.models import AgentTaskItem, ConversationMessage, TaskRecord, TaskStatus
 
 if TYPE_CHECKING:
     from agentcord.bot import AgentCordBot
@@ -33,6 +33,27 @@ class ActivityEntry:
     transient: bool = False
 
 
+@dataclass(slots=True)
+class ConversationEntry:
+    role: str
+    text: str
+
+
+@dataclass(slots=True)
+class ChoiceOptionEntry:
+    label: str
+    value: str
+    description: str = ""
+
+
+@dataclass(slots=True)
+class PendingChoiceState:
+    prompt: str
+    options: list[ChoiceOptionEntry]
+    placeholder: str
+    future: asyncio.Future[dict[str, str]]
+
+
 class AgentConversationSession:
     def __init__(self, bot: AgentCordBot, user: discord.abc.User, task: TaskRecord) -> None:
         self.bot = bot
@@ -40,6 +61,8 @@ class AgentConversationSession:
         self.task_record = task
         self.guild: discord.Guild | None = None
         self.task_items = list(task.task_items)
+        self._conversation_entries: deque[ConversationEntry] = deque(self._load_conversation_entries(task.messages))
+        self._pending_choice: PendingChoiceState | None = None
         self.context_state = ContextWindowState(
             model=task.model,
             context_length=task.context_length,
@@ -77,6 +100,7 @@ class AgentConversationSession:
 
     async def close(self, reason: str | None = None) -> None:
         self._closed = True
+        self._cancel_pending_choice("對話已關閉。")
         if reason:
             self._append_activity(reason)
         self.view.disable_all_items()
@@ -84,12 +108,16 @@ class AgentConversationSession:
         await self.request_render(force=True)
 
     async def enqueue_prompt(self, prompt: str) -> None:
+        normalized_prompt = str(prompt).strip()
+        if not normalized_prompt:
+            raise ValueError("訊息不可為空白。")
         if self._closed:
             raise ValueError("這個對話已關閉，請重新開啟新的對話。")
-        await self._prompt_queue.put(prompt)
+        self._append_conversation("user", normalized_prompt)
+        await self._prompt_queue.put(normalized_prompt)
         await self.bot.log_event(
             "Agent 對話訊息",
-            f"送出 agent 對話訊息。\nTask ID: {self.task_record.id}\nPrompt: {self._shorten(' '.join(prompt.split()), 300)}",
+            f"送出 agent 對話訊息。\nTask ID: {self.task_record.id}\nPrompt: {self._shorten(' '.join(normalized_prompt.split()), 300)}",
             user=self.user,
             guild=self.guild,
         )
@@ -100,6 +128,7 @@ class AgentConversationSession:
             self._worker_task = asyncio.create_task(self._worker_loop())
 
     async def interrupt(self) -> None:
+        self._cancel_pending_choice("已取消等待使用者選擇。")
         while not self._prompt_queue.empty():
             try:
                 self._prompt_queue.get_nowait()
@@ -120,7 +149,7 @@ class AgentConversationSession:
         self._current_run_task.cancel()
         await self.request_render(force=True)
 
-    async def handle_progress(self, event: dict[str, object]) -> None:
+    async def handle_progress(self, event: dict[str, object]) -> object | None:
         event_type = str(event.get("type", ""))
         if event_type == "activity":
             raw_key = str(event["activity_key"]) if isinstance(event.get("activity_key"), str) else None
@@ -137,6 +166,12 @@ class AgentConversationSession:
         elif event_type == "activity_remove":
             raw_key = str(event["activity_key"]) if isinstance(event.get("activity_key"), str) else None
             self._remove_activity(self._scope_activity_key(raw_key))
+        elif event_type == "chat_message":
+            role = str(event.get("role") or "assistant")
+            message = str(event.get("message") or "")
+            self._append_conversation(role, message)
+        elif event_type == "choice_request":
+            return await self._request_user_choice(event)
         elif event_type == "tasks":
             self.task_items = [
                 AgentTaskItem(
@@ -166,6 +201,7 @@ class AgentConversationSession:
             if isinstance(phase, str):
                 self.context_state.phase = phase
         await self.request_render()
+        return None
 
     async def request_render(self, *, force: bool = False) -> None:
         if self.message is None:
@@ -204,7 +240,7 @@ class AgentConversationSession:
             prompt = await self._prompt_queue.get()
             self._run_sequence += 1
             self._active_run_scope = f"run:{self._run_sequence}"
-            self._append_activity(f"開始處理使用者訊息：{prompt}")
+            self._append_activity("開始處理新的使用者訊息。")
             await self.request_render(force=True)
             try:
                 self._current_run_task = asyncio.create_task(
@@ -225,7 +261,7 @@ class AgentConversationSession:
                     summary=self.task_record.summary or "已中斷目前執行。",
                     plan=self.task_record.plan,
                     validations=self.task_record.validations,
-                    messages=self.task_record.messages,
+                    messages=self._build_persisted_messages(),
                     task_items=self.task_items,
                     model=self.context_state.model or self.task_record.model,
                     context_length=self.context_state.context_length,
@@ -248,7 +284,7 @@ class AgentConversationSession:
                     summary=f"執行失敗：{exc}",
                     plan=self.task_record.plan,
                     validations=self.task_record.validations,
-                    messages=self.task_record.messages,
+                    messages=self._build_persisted_messages(),
                     task_items=self.task_items,
                     model=self.context_state.model or self.task_record.model,
                     context_length=self.context_state.context_length,
@@ -271,7 +307,8 @@ class AgentConversationSession:
                 self.context_state.compression_count = result.compression_count
                 self.context_state.history_messages = len(result.messages)
                 self.context_state.phase = "completed"
-                self._append_activity(f"本輪完成：{result.summary}")
+                self._append_conversation("assistant", result.summary)
+                self._append_activity("本輪已完成。")
                 await self.bot.log_event(
                     "Agent 完成",
                     f"agent 對話完成。\nTask ID: {self.task_record.id}\nSummary: {self._shorten(result.summary, 300)}",
@@ -289,7 +326,20 @@ class AgentConversationSession:
                 await self.request_render(force=True)
 
     def render_content(self) -> str:
-        return self._render_activity_display()
+        return self._render_conversation_display()
+
+    def _render_conversation_display(self) -> str:
+        conversation_lines = [self._format_conversation_entry(entry) for entry in self._conversation_entries] or ["(無)"]
+        content = self._compose_conversation_display(conversation_lines)
+        while len(content) > _MESSAGE_LIMIT and len(conversation_lines) > 1:
+            conversation_lines = conversation_lines[1:]
+            content = self._compose_conversation_display(conversation_lines)
+        if len(content) > _MESSAGE_LIMIT:
+            return content[: _MESSAGE_LIMIT - 3] + "..."
+        return content
+
+    def _compose_conversation_display(self, conversation_lines: list[str]) -> str:
+        return "\n".join(["## 對話", *conversation_lines])
 
     def _render_activity_display(self) -> str:
         activity_lines = [f"-# {entry.text}" for entry in self._activity_lines] or ["-# 等待新的 agent 訊息。"]
@@ -304,6 +354,17 @@ class AgentConversationSession:
     def _compose_activity_display(self, activity_lines: list[str]) -> str:
         parts = ["## AI 在幹什麼", *activity_lines]
         return "\n".join(parts)
+
+    def _render_choice_block(self) -> str:
+        if self._pending_choice is None:
+            return "## 請選擇\n(目前沒有待選項目)"
+        lines = ["## 請選擇", self._shorten(" ".join(self._pending_choice.prompt.split()), 180)]
+        for index, option in enumerate(self._pending_choice.options, start=1):
+            option_line = f"{index}. {self._shorten(option.label, 90)}"
+            if option.description:
+                option_line = f"{option_line} | {self._shorten(option.description, 70)}"
+            lines.append(option_line)
+        return "\n".join(lines)
 
     def _render_tasks_block(self) -> str:
         header = ["## 待辦事項"]
@@ -360,6 +421,100 @@ class AgentConversationSession:
             return "執行中"
         return "待命"
 
+    def _load_conversation_entries(self, messages: list[ConversationMessage]) -> list[ConversationEntry]:
+        entries: list[ConversationEntry] = []
+        for message in messages:
+            if message.role not in {"user", "assistant"}:
+                continue
+            normalized = str(message.content).strip()
+            if not normalized:
+                continue
+            entries.append(ConversationEntry(role=message.role, text=normalized))
+        return entries
+
+    def _build_persisted_messages(self) -> list[ConversationMessage]:
+        system_messages = [message for message in self.task_record.messages if message.role == "system"]
+        conversation_messages = [
+            ConversationMessage(role=entry.role, content=entry.text)
+            for entry in self._conversation_entries
+        ]
+        return [*system_messages, *conversation_messages]
+
+    def _append_conversation(self, role: str, text: str) -> None:
+        normalized = str(text).strip()
+        if not normalized or role not in {"user", "assistant"}:
+            return
+        if self._conversation_entries:
+            last_entry = self._conversation_entries[-1]
+            if last_entry.role == role and last_entry.text == normalized:
+                return
+        self._conversation_entries.append(ConversationEntry(role=role, text=normalized))
+
+    def _format_conversation_entry(self, entry: ConversationEntry) -> str:
+        formatted = self._shorten(" ".join(entry.text.split()), 220)
+        if entry.role == "user":
+            return f"> {formatted}"
+        return formatted
+
+    async def _request_user_choice(self, event: dict[str, object]) -> dict[str, str]:
+        if self._pending_choice is not None:
+            raise ValueError("目前已有一個待選的使用者選項。")
+        prompt = str(event.get("message") or "").strip()
+        if not prompt:
+            raise ValueError("選項請求缺少 message。")
+        raw_options = event.get("options")
+        if not isinstance(raw_options, list) or not raw_options:
+            raise ValueError("選項請求缺少 options。")
+        options: list[ChoiceOptionEntry] = []
+        for index, item in enumerate(raw_options[:25], start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"選項請求的 options[{index}] 格式無效。")
+            label = str(item.get("label") or "").strip()
+            value = str(item.get("value") or "").strip()
+            description = str(item.get("description") or "").strip()
+            if not label or not value:
+                raise ValueError(f"選項請求的 options[{index}] 缺少 label 或 value。")
+            options.append(ChoiceOptionEntry(label=label, value=value, description=description))
+
+        future: asyncio.Future[dict[str, str]] = asyncio.get_running_loop().create_future()
+        self._pending_choice = PendingChoiceState(
+            prompt=prompt,
+            options=options,
+            placeholder=str(event.get("placeholder") or "").strip() or "請選擇一個選項",
+            future=future,
+        )
+        self._append_conversation("assistant", prompt)
+        self._append_activity("等待使用者從選項中做決定。", key="choice")
+        await self.request_render(force=True)
+        try:
+            return await future
+        finally:
+            self._pending_choice = None
+            self._remove_activity("choice")
+            await self.request_render(force=True)
+
+    async def submit_choice(self, value: str) -> None:
+        if self._pending_choice is None:
+            raise ValueError("目前沒有待選項目。")
+        selected = next((option for option in self._pending_choice.options if option.value == value), None)
+        if selected is None:
+            raise ValueError("找不到對應的選項。")
+        self._append_conversation("user", selected.label)
+        if not self._pending_choice.future.done():
+            self._pending_choice.future.set_result({"label": selected.label, "value": selected.value})
+        await self.bot.log_event(
+            "Agent 選項回覆",
+            f"使用者回覆 agent 選項。\nTask ID: {self.task_record.id}\n選項: {self._shorten(selected.label, 150)}",
+            user=self.user,
+            guild=self.guild,
+        )
+
+    def _cancel_pending_choice(self, reason: str) -> None:
+        if self._pending_choice is None:
+            return
+        if not self._pending_choice.future.done():
+            self._pending_choice.future.set_exception(ValueError(reason))
+
     def _append_activity(self, text: str, *, key: str | None = None, transient: bool = False) -> None:
         normalized = " ".join(str(text).split())
         if not normalized:
@@ -408,13 +563,22 @@ class AgentConversationView(discord.ui.LayoutView):
     def __init__(self, session: AgentConversationSession) -> None:
         super().__init__(timeout=None)
         self.session = session
+        self._conversation_display = discord.ui.TextDisplay("## 對話\n(無)")
         self._activity_display = discord.ui.TextDisplay("## AI 在幹什麼\n-# 等待新的 agent 訊息。")
+        self._choice_display = discord.ui.TextDisplay("## 請選擇\n(目前沒有待選項目)")
         self._tasks_display = discord.ui.TextDisplay("## 待辦事項\n(無)")
         self._context_display = discord.ui.TextDisplay("-# (未設定)")
         self._operations_display = discord.ui.TextDisplay("-# #0")
+        self._after_conversation_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._after_activity_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
+        self._after_choice_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._after_tasks_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
         self._after_context_separator = discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
+        self._choice_select = AgentChoiceSelect(self)
+        self._choice_select_row = discord.ui.ActionRow(self._choice_select)
+        self._choice_cancel_button = discord.ui.Button(label="取消選擇", style=discord.ButtonStyle.secondary)
+        self._choice_cancel_button.callback = self._on_cancel_choice
+        self._choice_actions_row = discord.ui.ActionRow(self._choice_cancel_button)
         self._interrupt_button = discord.ui.Button(label="中斷", style=discord.ButtonStyle.danger)
         self._interrupt_button.callback = self._on_interrupt
         self._send_message_button = discord.ui.Button(label="傳送訊息", style=discord.ButtonStyle.primary)
@@ -450,7 +614,17 @@ class AgentConversationView(discord.ui.LayoutView):
         await interaction.response.defer()
         await self.session.request_render(force=True)
 
+    async def _on_cancel_choice(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.session.user.id:
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            return
+        await interaction.response.defer()
+        self.session._cancel_pending_choice("使用者取消了選項選擇。")
+        await self.session.request_render(force=True)
+
     def disable_all_items(self) -> None:
+        self._choice_select.disabled = True
+        self._choice_cancel_button.disabled = True
         self._interrupt_button.disabled = True
         self._send_message_button.disabled = True
         self._refresh_button.disabled = True
@@ -459,12 +633,21 @@ class AgentConversationView(discord.ui.LayoutView):
         if self.session._closed:
             self.disable_all_items()
             return
+        self._choice_select.sync_from_session()
+        self._choice_cancel_button.disabled = self.session._pending_choice is None
         self._interrupt_button.disabled = not self.session.is_busy()
 
     def _rebuild_container(self) -> None:
         self._container.clear_items()
+        self._container.add_item(self._conversation_display)
+        self._container.add_item(self._after_conversation_separator)
         self._container.add_item(self._activity_display)
         self._container.add_item(self._after_activity_separator)
+        if self.session._pending_choice is not None:
+            self._container.add_item(self._choice_display)
+            self._container.add_item(self._choice_select_row)
+            self._container.add_item(self._choice_actions_row)
+            self._container.add_item(self._after_choice_separator)
         if self.session.task_items:
             self._container.add_item(self._tasks_display)
             self._container.add_item(self._after_tasks_separator)
@@ -474,12 +657,54 @@ class AgentConversationView(discord.ui.LayoutView):
         self._container.add_item(self._actions_row)
 
     def sync_layout(self) -> None:
+        self._conversation_display.content = self.session._render_conversation_display()
         self._activity_display.content = self.session._render_activity_display()
+        self._choice_display.content = self.session._render_choice_block()
         self._tasks_display.content = self.session._render_tasks_block()
         self._context_display.content = self.session._render_context_block()
         self._operations_display.content = self.session._render_operations_block()
         self.sync_buttons()
         self._rebuild_container()
+
+
+class AgentChoiceSelect(discord.ui.Select):
+    def __init__(self, view: AgentConversationView) -> None:
+        super().__init__(
+            placeholder="目前沒有待選項目",
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label="目前沒有待選項目", value="__none__")],
+            disabled=True,
+        )
+        self.parent_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.parent_view.session.user.id:
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。")
+            return
+        if self.parent_view.session._pending_choice is None:
+            await interaction.response.send_message("目前沒有待選項目。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.parent_view.session.submit_choice(self.values[0])
+
+    def sync_from_session(self) -> None:
+        pending_choice = self.parent_view.session._pending_choice
+        if pending_choice is None:
+            self.disabled = True
+            self.placeholder = "目前沒有待選項目"
+            self.options = [discord.SelectOption(label="目前沒有待選項目", value="__none__")]
+            return
+        self.disabled = False
+        self.placeholder = pending_choice.placeholder
+        self.options = [
+            discord.SelectOption(
+                label=self.parent_view.session._shorten(option.label, 100),
+                value=option.value,
+                description=self.parent_view.session._shorten(option.description, 100) if option.description else None,
+            )
+            for option in pending_choice.options[:25]
+        ]
 
 
 class AgentMessageModal(discord.ui.Modal):

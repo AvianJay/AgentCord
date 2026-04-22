@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import inspect
 import json
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -25,7 +27,12 @@ from agentcord.pterodactyl import (
 )
 from agentcord.workspace import WorkspaceError, WorkspaceManager
 
-ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+ProgressCallback = Callable[[dict[str, Any]], Awaitable[Any] | Any | None]
+
+_CURRENT_CONVERSATION_MESSAGES: contextvars.ContextVar[list[ConversationMessage] | None] = contextvars.ContextVar(
+    "agentcord_current_conversation_messages",
+    default=None,
+)
 
 
 @dataclass(slots=True)
@@ -122,7 +129,8 @@ class CodingAgent:
         actual_model = config.model
 
         history_messages = list(task.messages) if task is not None else []
-        history_messages.append(ConversationMessage(role="user", content=prompt))
+        if not history_messages or history_messages[-1].role != "user" or history_messages[-1].content != prompt:
+            history_messages.append(ConversationMessage(role="user", content=prompt))
         compression_count = task.compression_count if task is not None else 0
         history_messages, compression_count = await self._compress_context_if_needed(
             user_id,
@@ -155,145 +163,149 @@ class CodingAgent:
                 compression_count=compression_count,
             )
 
-        await self._emit_progress(
-            progress_callback,
-            {
-                "type": "activity",
-                "activity_key": "task",
-                "message": f"任務 #{task.id} 執行中。",
-            },
-        )
-
-        plan = list(task.plan) if task.plan else []
-        transcript: list[dict[str, str]] = []
-        changed_files: set[str] = set(task.related_files)
-        validations: list[str] = []
-        final_summary = task.summary or "未進行任何變更。"
-        current_task_items = list(task.task_items)
-        estimated_tokens = 0
-
-        for iteration in range(1, self.settings.agent_max_iterations + 1):
-            context = self._build_iteration_context(user_id, prompt, plan, transcript, history_messages, current_task_items)
-            estimated_tokens = estimate_tokens(context)
+        conversation_token = _CURRENT_CONVERSATION_MESSAGES.set(history_messages)
+        try:
             await self._emit_progress(
                 progress_callback,
                 {
-                    "type": "context",
-                    "model": actual_model,
-                    "context_length": context_length,
-                    "estimated_tokens": estimated_tokens,
-                    "compression_count": compression_count,
-                    "history_messages": len(history_messages),
-                    "phase": f"iteration-{iteration}",
+                    "type": "activity",
+                    "activity_key": "task",
+                    "message": f"任務 #{task.id} 執行中。",
                 },
             )
-            self.credits.ensure_affordable(user_id, config, context)
-            await self._emit_activity(
-                progress_callback,
-                f"第 {iteration} 輪決策生成中。",
-                activity_key=f"decision:{iteration}",
-            )
-            step_response = await provider.stream_generate(
-                [
-                    {"role": "system", "content": self._build_agent_system_prompt()},
-                    {"role": "user", "content": context},
-                ],
-                on_delta=self._build_stream_progress_callback(
-                    f"第 {iteration} 輪決策生成中",
-                    progress_callback,
-                    activity_key=f"decision:{iteration}",
-                ),
-            )
-            self.credits.charge(user_id, step_response.usage.cost)
-            actual_model = step_response.model or actual_model
-            await self._emit_progress(
-                progress_callback,
-                {
-                    "type": "context",
-                    "model": actual_model,
-                    "context_length": context_length,
-                    "estimated_tokens": estimated_tokens,
-                    "compression_count": compression_count,
-                    "history_messages": len(history_messages),
-                    "phase": f"iteration-{iteration}",
-                },
-            )
-            decision = parse_json_object(step_response.content)
-            await self._remove_activity(progress_callback, activity_key=f"decision:{iteration}")
-            tool_results, touched_files, current_task_items = await self._execute_actions(
-                user_id,
-                self._extract_decision_actions(decision),
-                current_task_items,
-                progress_callback,
-                iteration,
-            )
-            changed_files.update(touched_files)
 
-            validations.extend(self._validate_changed_python_files(user_id, touched_files))
-            if validations:
+            plan = list(task.plan) if task.plan else []
+            transcript: list[dict[str, str]] = []
+            changed_files: set[str] = set(task.related_files)
+            validations: list[str] = []
+            final_summary = task.summary or "未進行任何變更。"
+            current_task_items = list(task.task_items)
+            estimated_tokens = 0
+
+            for iteration in range(1, self.settings.agent_max_iterations + 1):
+                context = self._build_iteration_context(user_id, prompt, plan, transcript, history_messages, current_task_items)
+                estimated_tokens = estimate_tokens(context)
                 await self._emit_activity(
                     progress_callback,
-                    f"目前累積 {len(validations)} 筆驗證結果。",
-                    activity_key="validation",
+                    f"第 {iteration} 輪決策生成中。",
+                    activity_key=f"decision:{iteration}",
                 )
-            transcript.append(
-                {
-                    "role": "assistant",
-                    "content": json.dumps(
-                        {
-                            "decision": decision,
-                            "tool_results": tool_results,
-                            "validations": validations[-len(touched_files) :] if touched_files else [],
-                        },
-                        ensure_ascii=False,
+                await self._emit_progress(
+                    progress_callback,
+                    {
+                        "type": "context",
+                        "model": actual_model,
+                        "context_length": context_length,
+                        "estimated_tokens": estimated_tokens,
+                        "compression_count": compression_count,
+                        "history_messages": len(history_messages),
+                        "phase": f"iteration-{iteration}",
+                    },
+                )
+                self.credits.ensure_affordable(user_id, config, context)
+                step_response = await provider.stream_generate(
+                    [
+                        {"role": "system", "content": self._build_agent_system_prompt()},
+                        {"role": "user", "content": context},
+                    ],
+                    on_delta=self._build_stream_progress_callback(
+                        f"第 {iteration} 輪決策生成中",
+                        progress_callback,
+                        activity_key=f"decision:{iteration}",
                     ),
-                }
-            )
-            final_summary = str(decision.get("summary", final_summary))
-            await self._emit_activity(
-                progress_callback,
-                f"目前摘要：{final_summary}",
-                activity_key="summary",
-            )
-            if decision.get("done"):
-                break
+                )
+                self.credits.charge(user_id, step_response.usage.cost)
+                actual_model = step_response.model or actual_model
+                await self._emit_progress(
+                    progress_callback,
+                    {
+                        "type": "context",
+                        "model": actual_model,
+                        "context_length": context_length,
+                        "estimated_tokens": estimated_tokens,
+                        "compression_count": compression_count,
+                        "history_messages": len(history_messages),
+                        "phase": f"iteration-{iteration}",
+                    },
+                )
+                decision = parse_json_object(step_response.content)
+                await self._remove_activity(progress_callback, activity_key=f"decision:{iteration}")
+                tool_results, touched_files, current_task_items = await self._execute_actions(
+                    user_id,
+                    self._extract_decision_actions(decision),
+                    current_task_items,
+                    progress_callback,
+                    iteration,
+                )
+                changed_files.update(touched_files)
 
-        related_files = sorted(changed_files)
-        history_messages.append(ConversationMessage(role="assistant", content=final_summary))
-        task = self.db.update_task(
-            task.id,
-            TaskStatus.DONE,
-            related_files,
-            summary=final_summary,
-            plan=plan,
-            validations=validations,
-            messages=history_messages,
-            task_items=current_task_items,
-            model=actual_model,
-            context_length=context_length,
-            compression_count=compression_count,
-        )
-        await self._emit_progress(
-            progress_callback,
-            {
-                "type": "activity",
-                "activity_key": "task",
-                "message": f"任務 #{task.id} 已完成。",
-            },
-        )
-        return AgentRunResult(
-            summary=final_summary,
-            plan=plan,
-            related_files=related_files,
-            validations=validations,
-            messages=history_messages,
-            task_items=current_task_items,
-            model=actual_model,
-            context_length=context_length,
-            estimated_tokens=estimated_tokens,
-            compression_count=compression_count,
-            task_id=task.id,
-        )
+                validations.extend(self._validate_changed_python_files(user_id, touched_files))
+                if validations:
+                    await self._emit_activity(
+                        progress_callback,
+                        f"目前累積 {len(validations)} 筆驗證結果。",
+                        activity_key="validation",
+                    )
+                transcript.append(
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "decision": decision,
+                                "tool_results": tool_results,
+                                "validations": validations[-len(touched_files) :] if touched_files else [],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                final_summary = str(decision.get("summary", final_summary))
+                await self._emit_activity(
+                    progress_callback,
+                    f"目前摘要：{final_summary}",
+                    activity_key="summary",
+                )
+                if decision.get("done"):
+                    break
+
+            related_files = sorted(changed_files)
+            history_messages.append(ConversationMessage(role="assistant", content=final_summary))
+            task = self.db.update_task(
+                task.id,
+                TaskStatus.DONE,
+                related_files,
+                summary=final_summary,
+                plan=plan,
+                validations=validations,
+                messages=history_messages,
+                task_items=current_task_items,
+                model=actual_model,
+                context_length=context_length,
+                compression_count=compression_count,
+            )
+            await self._emit_progress(
+                progress_callback,
+                {
+                    "type": "activity",
+                    "activity_key": "task",
+                    "message": f"任務 #{task.id} 已完成。",
+                },
+            )
+            return AgentRunResult(
+                summary=final_summary,
+                plan=plan,
+                related_files=related_files,
+                validations=validations,
+                messages=history_messages,
+                task_items=current_task_items,
+                model=actual_model,
+                context_length=context_length,
+                estimated_tokens=estimated_tokens,
+                compression_count=compression_count,
+                task_id=task.id,
+            )
+        finally:
+            _CURRENT_CONVERSATION_MESSAGES.reset(conversation_token)
 
     async def plan(
         self,
@@ -545,6 +557,44 @@ class CodingAgent:
                     "required": ["url"],
                 },
                 handler_name="_tool_fetch_url",
+            ),
+            AgentToolSpec(
+                name="send_message",
+                description="在執行中直接向使用者發送一則訊息，不中斷後續工具操作。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "要發送給使用者的訊息。"},
+                    },
+                    "required": ["message"],
+                },
+                handler_name="_tool_send_message",
+            ),
+            AgentToolSpec(
+                name="ask_user_choice",
+                description="向使用者顯示一組選項並等待對方選擇後再繼續。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "要顯示給使用者的問題或說明。"},
+                        "placeholder": {"type": "string", "description": "選單 placeholder。"},
+                        "options": {
+                            "type": "array",
+                            "description": "可選項目列表。",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "value": {"type": "string"},
+                                    "description": {"type": "string"},
+                                },
+                                "required": ["label", "value"],
+                            },
+                        },
+                    },
+                    "required": ["message", "options"],
+                },
+                handler_name="_tool_ask_user_choice",
             ),
             AgentToolSpec(
                 name="sleep",
@@ -1042,6 +1092,50 @@ class CodingAgent:
         outcome = await self._fetch_url(user_id, url)
         return ({"url": url, "result": outcome}, [], current_task_items)
 
+    async def _tool_send_message(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del user_id
+        message = self._require_string_argument(action, "message", allow_empty=True)
+        self._append_conversation_message("assistant", message)
+        await self._emit_chat_message(progress_callback, "assistant", message)
+        return ({"message": message, "result": "sent"}, [], current_task_items)
+
+    async def _tool_ask_user_choice(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del user_id
+        message = self._require_string_argument(action, "message", allow_empty=True)
+        placeholder = str(action.get("placeholder") or "").strip()
+        options = self._require_choice_options(action)
+        self._append_conversation_message("assistant", message)
+        selection = await self._request_user_choice(
+            progress_callback,
+            message,
+            options,
+            placeholder=placeholder,
+        )
+        selected_label = str(selection.get("label") or selection.get("value") or "").strip()
+        selected_value = str(selection.get("value") or selected_label).strip()
+        self._append_conversation_message("user", selected_label)
+        return (
+            {
+                "message": message,
+                "selected": {"label": selected_label, "value": selected_value},
+                "result": "selected",
+            },
+            [],
+            current_task_items,
+        )
+
     async def _tool_sleep(
         self,
         user_id: int,
@@ -1063,7 +1157,12 @@ class CodingAgent:
     ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
         del progress_callback
         server = self._require_string_argument(action, "server")
-        result = await get_pterodactyl_startup(self.session, self.db.get_pterodactyl_config(user_id), server)
+        result = await get_pterodactyl_startup(
+            self.session,
+            self.settings,
+            self.db.get_pterodactyl_config(user_id),
+            server,
+        )
         return ({"server": server, "result": result}, [], current_task_items)
 
     async def _tool_pterodactyl_set_startup_variable(
@@ -1357,6 +1456,70 @@ class CodingAgent:
                 result.append(normalized)
         return result
 
+    def _require_choice_options(self, action: dict[str, Any]) -> list[dict[str, str]]:
+        raw_options = action.get("options")
+        if not isinstance(raw_options, list) or not raw_options:
+            raise ValueError(f"工具 {action.get('tool')} 需要至少一個 options 項目。")
+        options: list[dict[str, str]] = []
+        for index, item in enumerate(raw_options[:25], start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"工具 {action.get('tool')} 的 options[{index}] 必須是物件。")
+            label = str(item.get("label") or "").strip()
+            value = str(item.get("value") or "").strip()
+            description = str(item.get("description") or "").strip()
+            if not label or not value:
+                raise ValueError(f"工具 {action.get('tool')} 的 options[{index}] 缺少 label 或 value。")
+            options.append({"label": label, "value": value, "description": description})
+        return options
+
+    def _append_conversation_message(self, role: str, content: str) -> None:
+        normalized = str(content).strip()
+        if not normalized:
+            return
+        messages = _CURRENT_CONVERSATION_MESSAGES.get()
+        if messages is None:
+            return
+        messages.append(ConversationMessage(role=role, content=normalized))
+
+    async def _emit_chat_message(self, progress_callback: ProgressCallback | None, role: str, message: str) -> None:
+        await self._emit_progress(
+            progress_callback,
+            {
+                "type": "chat_message",
+                "role": role,
+                "message": message,
+            },
+        )
+
+    async def _request_user_choice(
+        self,
+        progress_callback: ProgressCallback | None,
+        message: str,
+        options: list[dict[str, str]],
+        *,
+        placeholder: str = "",
+    ) -> dict[str, str]:
+        if progress_callback is None:
+            raise ValueError("目前無法向使用者請求選項。")
+        maybe_result = progress_callback(
+            {
+                "type": "choice_request",
+                "message": message,
+                "placeholder": placeholder,
+                "options": options,
+            }
+        )
+        if inspect.isawaitable(maybe_result):
+            result = await maybe_result
+        else:
+            result = maybe_result
+        if not isinstance(result, dict):
+            raise ValueError("使用者選項回應格式無效。")
+        return {
+            "label": str(result.get("label") or "").strip(),
+            "value": str(result.get("value") or "").strip(),
+        }
+
     def _require_number_argument(
         self,
         action: dict[str, Any],
@@ -1553,6 +1716,8 @@ class CodingAgent:
             "py_compile_check": "語法檢查",
             "search_web": "搜尋網路",
             "fetch_url": "抓取網址",
+            "send_message": "發送訊息",
+            "ask_user_choice": "請使用者選擇",
             "sleep": "等待",
             "pterodactyl_read_startup": "讀取 startup",
             "pterodactyl_set_startup_variable": "更新 startup 變數",
@@ -1590,6 +1755,10 @@ class CodingAgent:
             return f"搜尋網路中：{action.get('query', '')}"
         if tool_name == "fetch_url":
             return f"抓取網址中：{action.get('url', '')}"
+        if tool_name == "send_message":
+            return "發送訊息中。"
+        if tool_name == "ask_user_choice":
+            return "等待使用者選擇中。"
         if tool_name == "sleep":
             return f"等待中：{action.get('seconds', '')} 秒"
         if tool_name == "pterodactyl_read_startup":
@@ -1624,6 +1793,10 @@ class CodingAgent:
             return "搜尋網路已完成。"
         if tool_name == "fetch_url":
             return "抓取網址已完成。"
+        if tool_name == "send_message":
+            return "訊息已發送。"
+        if tool_name == "ask_user_choice":
+            return "已收到使用者選擇。"
         if tool_name == "sleep":
             return "等待已完成。"
         if tool_name in {
@@ -1719,6 +1892,8 @@ _AGENT_SYSTEM_PROMPT_PREFIX = """
 - 只回傳合法 JSON。
 - summary 與 related_files 內容請使用繁體中文。
 - fetch_url 可直接抓取公開網址內容；若設定了 PROXY_* 環境變數，會透過 proxy 抓取，不需要先經過 search_web。
+- 可使用 send_message 在執行中直接對使用者說明你正在做什麼、遇到什麼情況、或通知下一步。
+- 若需要使用者做明確決策，請使用 ask_user_choice，而不是自己猜測。收到選擇後再繼續操作。
 - 若使用者已透過 /set-pterodactyl 設定 Pterodactyl Client API，可使用 pterodactyl_request 查詢或操作其有權限的伺服器資源。
 - pterodactyl_sync_workspace 會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄；如有需要可額外提供 ignore_patterns。
 - pterodactyl_read_console 只能擷取建立連線後的 live 輸出；若要觀察啟動過程，請在 power_action 後立刻呼叫，必要時再搭配 sleep。
