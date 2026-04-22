@@ -719,7 +719,7 @@ class CodingAgent:
                 description=(
                     "在目前 agent 工作區與指定 Pterodactyl 伺服器路徑之間同步文字檔。"
                     "可用 direction=push 把工作區推到伺服器，或 direction=pull 把伺服器拉回工作區。"
-                    "列舉與同步時都會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄，"
+                    "列舉與同步時都會自動忽略 .npm、.venv、venv、node_modules、__pycache__ 等大型或衍生目錄，"
                     "也可以額外提供 ignore_patterns。"
                 ),
                 parameters={
@@ -2149,7 +2149,7 @@ _AGENT_SYSTEM_PROMPT_PREFIX = """
 - 可使用 send_message 在執行中直接對使用者說明你正在做什麼、遇到什麼情況、或通知下一步。
 - 若需要使用者做明確決策，請使用 ask_user_choice，而不是自己猜測。它支援單選、多選與自由輸入，收到回覆後再繼續操作。
 - 若使用者已透過 /set-pterodactyl 設定 Pterodactyl Client API，可使用 pterodactyl_request 查詢或操作其有權限的伺服器資源。
-- pterodactyl_sync_workspace 可將工作區推到伺服器，也可從伺服器拉回工作區；兩個方向都會套用 ignore_patterns，且在列舉與同步階段都會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄。
+- pterodactyl_sync_workspace 可將工作區推到伺服器，也可從伺服器拉回工作區；兩個方向都會套用 ignore_patterns，且在列舉與同步階段都會自動忽略 .npm、.venv、venv、node_modules、__pycache__ 等大型或衍生目錄。
 - pterodactyl_read_console 只能擷取建立連線後的 live 輸出；若要觀察啟動過程，請在 power_action 後立刻呼叫，必要時再搭配 sleep。
 - 如果目前工作有明確步驟，請使用 tasks 工具更新工作清單，好讓使用者看到目前進度。
 """

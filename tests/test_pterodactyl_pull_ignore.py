@@ -14,6 +14,7 @@ class PterodactylPullIgnoreTests(unittest.IsolatedAsyncioTestCase):
             visited.append(directory_path)
             if directory_path == "/":
                 return [
+                    {"name": ".npm", "kind": "folder", "size": 0, "mimetype": "inode/directory"},
                     {"name": "node_modules", "kind": "folder", "size": 0, "mimetype": "inode/directory"},
                     {"name": "__pycache__", "kind": "folder", "size": 0, "mimetype": "inode/directory"},
                     {"name": "src", "kind": "folder", "size": 0, "mimetype": "inode/directory"},
@@ -38,6 +39,7 @@ class PterodactylPullIgnoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             manifest["skipped"],
             [
+                {"path": "/.npm", "reason": "ignored"},
                 {"path": "/node_modules", "reason": "ignored"},
                 {"path": "/__pycache__", "reason": "ignored"},
             ],

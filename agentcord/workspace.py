@@ -27,6 +27,7 @@ _DEFAULT_SYNC_IGNORE_PATTERNS = (
     ".git",
     ".hg",
     ".svn",
+    ".npm",
     ".venv",
     "venv",
     "env",

@@ -17,7 +17,8 @@ from agentcord.proxy import ProxyConfigurationError, build_proxy_request_kwargs,
 
 _CLIENT_ACCEPT_HEADER = "Application/vnd.pterodactyl.v1+json"
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
-_REMOTE_ENUMERATION_HARD_IGNORES = {".venv", "venv", "node_modules", "__pycache__"}
+_REMOTE_ENUMERATION_HARD_IGNORES = {".npm", ".venv", "venv", "node_modules", "__pycache__"}
+_PTERODACTYL_NETWORK_ERROR_TYPES = (aiohttp.ClientError, asyncio.TimeoutError, asyncio.IncompleteReadError)
 
 
 class PterodactylError(ValueError):
@@ -170,6 +171,12 @@ def _format_pterodactyl_network_error(exc: BaseException, settings: Settings, re
     target_host = urlsplit(request_url).netloc or request_url
     if settings.proxy_url:
         proxy_label = _redact_proxy_url(settings.proxy_url)
+        if isinstance(exc, asyncio.IncompleteReadError):
+            return (
+                "Pterodactyl 網路請求失敗：proxy 在 SOCKS 握手時提前關閉連線，未回傳完整回應。"
+                f"目標：{target_host}；proxy：{proxy_label}。"
+                "這通常代表 proxy 不穩定、協議不相容，或該 proxy 不允許連到此目標。"
+            )
         if isinstance(exc, aiohttp.ServerDisconnectedError):
             return (
                 "Pterodactyl 網路請求失敗：proxy 在建立連線時提前中斷。"
@@ -255,7 +262,7 @@ async def request_pterodactyl_client_api(
         raise PterodactylError(str(exc)) from exc
     except PterodactylError:
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+    except _PTERODACTYL_NETWORK_ERROR_TYPES as exc:
         raise PterodactylError(_format_pterodactyl_network_error(exc, settings, url)) from exc
 
 
@@ -717,7 +724,7 @@ async def read_pterodactyl_console(
         raise PterodactylError(str(exc)) from exc
     except PterodactylError:
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+    except _PTERODACTYL_NETWORK_ERROR_TYPES as exc:
         raise PterodactylError(_format_pterodactyl_network_error(exc, settings, socket_url)) from exc
 
     return {
