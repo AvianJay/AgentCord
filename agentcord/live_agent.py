@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import discord
 
 from agentcord.models import AgentTaskItem, ConversationMessage, TaskRecord, TaskStatus
+from agentcord.workspace import WorkspaceError
 
 if TYPE_CHECKING:
     from agentcord.bot import AgentCordBot
@@ -93,6 +94,8 @@ class AgentConversationSession:
         self._closed = False
         self._run_sequence = 0
         self._active_run_scope: str | None = None
+        self._pending_file_changes: list[dict[str, Any]] = []
+        self._refresh_pending_file_changes()
         if task.summary:
             self._append_activity(f"目前摘要：{task.summary}")
 
@@ -105,8 +108,11 @@ class AgentConversationSession:
 
     async def open(self, interaction: discord.Interaction, *, reopened: bool = False) -> None:
         self.guild = interaction.guild
+        self._refresh_pending_file_changes()
         if reopened:
             self._append_activity(f"已重新打開對話 #{self.task_record.id}。")
+            if self._pending_file_changes:
+                self._append_activity(f"已恢復 {len(self._pending_file_changes)} 個待確認變更。")
         self.view.sync_layout()
         await interaction.response.send_message(view=self.view)
         self.message = await interaction.original_response()
@@ -320,7 +326,10 @@ class AgentConversationSession:
                 self.context_state.compression_count = result.compression_count
                 self.context_state.history_messages = len(result.messages)
                 self.context_state.phase = "completed"
+                self._refresh_pending_file_changes()
                 self._append_conversation("assistant", result.summary)
+                if self._pending_file_changes:
+                    self._append_activity(f"目前有 {len(self._pending_file_changes)} 個待確認變更，可按下「檢視變更」。")
                 self._append_activity("本輪已完成。")
                 await self.bot.log_event(
                     "Agent 完成",
@@ -414,6 +423,8 @@ class AgentConversationSession:
         lines = [
             f"-# #{self.task_record.id} | {self._status_label()} | {self._prompt_queue.qsize()} 則訊息待送出",
         ]
+        if self._pending_file_changes:
+            lines.append(f"-# 待確認變更：{len(self._pending_file_changes)} 個")
         return "\n".join(lines)
 
     def _status_label(self) -> str:
@@ -669,6 +680,38 @@ class AgentConversationSession:
     def _format_selected_choice_text(self, selected: list[ChoiceOptionEntry]) -> str:
         return "、".join(option.label for option in selected)
 
+    def _refresh_pending_file_changes(self) -> None:
+        try:
+            self._pending_file_changes = self.bot.workspace.list_task_file_changes(self.user.id, self.task_record.id)
+        except WorkspaceError:
+            self._pending_file_changes = []
+
+    def has_pending_file_changes(self) -> bool:
+        return bool(self._pending_file_changes)
+
+    def list_pending_file_changes(self) -> list[dict[str, Any]]:
+        self._refresh_pending_file_changes()
+        return [dict(item) for item in self._pending_file_changes]
+
+    def get_pending_file_change_diff(self, path: str) -> dict[str, Any]:
+        return self.bot.workspace.get_task_file_change_diff(self.user.id, self.task_record.id, path)
+
+    async def accept_pending_file_change(self, path: str) -> None:
+        self.bot.workspace.accept_task_file_change(self.user.id, self.task_record.id, path)
+        self._refresh_pending_file_changes()
+        await self.request_render(force=True)
+
+    async def revert_pending_file_change(self, path: str) -> None:
+        self.bot.workspace.revert_task_file_change(self.user.id, self.task_record.id, path)
+        self._refresh_pending_file_changes()
+        await self.request_render(force=True)
+
+    async def accept_all_pending_file_changes(self) -> int:
+        accepted = self.bot.workspace.accept_all_task_file_changes(self.user.id, self.task_record.id)
+        self._refresh_pending_file_changes()
+        await self.request_render(force=True)
+        return accepted
+
     @staticmethod
     def _coerce_bool(value: object, default: bool = False) -> bool:
         if isinstance(value, bool):
@@ -720,8 +763,11 @@ class AgentConversationView(discord.ui.LayoutView):
         self._interrupt_button.callback = self._on_interrupt
         self._send_message_button = discord.ui.Button(label="傳送訊息", style=discord.ButtonStyle.primary)
         self._send_message_button.callback = self._on_send_message
+        self._review_button = discord.ui.Button(label="檢視變更", style=discord.ButtonStyle.secondary)
+        self._review_button.callback = self._on_review_changes
         self._refresh_button = discord.ui.Button(label="重新整理", style=discord.ButtonStyle.secondary)
         self._refresh_button.callback = self._on_refresh
+        self._review_row = discord.ui.ActionRow(self._review_button)
         self._actions_row = discord.ui.ActionRow(
             self._interrupt_button,
             self._send_message_button,
@@ -749,7 +795,21 @@ class AgentConversationView(discord.ui.LayoutView):
             await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
             return
         await interaction.response.defer()
+        self.session._refresh_pending_file_changes()
         await self.session.request_render(force=True)
+
+    async def _on_review_changes(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.session.user.id:
+            await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
+            return
+        if self.session.is_busy():
+            await interaction.response.send_message("請等待目前執行完成後再檢視變更。", ephemeral=True)
+            return
+        if not self.session.has_pending_file_changes():
+            await interaction.response.send_message("目前沒有待確認變更。", ephemeral=True)
+            return
+        review_view = AgentTaskReviewPopupView(self.session)
+        await interaction.response.send_message(review_view.render_message(), ephemeral=True, view=review_view)
 
     async def _on_cancel_choice(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user.id:
@@ -774,6 +834,7 @@ class AgentConversationView(discord.ui.LayoutView):
         self._choice_cancel_button.disabled = True
         self._interrupt_button.disabled = True
         self._send_message_button.disabled = True
+        self._review_button.disabled = True
         self._refresh_button.disabled = True
 
     def sync_buttons(self) -> None:
@@ -786,6 +847,7 @@ class AgentConversationView(discord.ui.LayoutView):
         )
         self._choice_cancel_button.disabled = self.session._pending_choice is None
         self._interrupt_button.disabled = not self.session.is_busy()
+        self._review_button.disabled = self.session.is_busy() or not self.session.has_pending_file_changes()
 
     def _rebuild_container(self) -> None:
         self._container.clear_items()
@@ -803,6 +865,8 @@ class AgentConversationView(discord.ui.LayoutView):
         self._container.add_item(self._context_display)
         self._container.add_item(self._after_context_separator)
         self._container.add_item(self._operations_display)
+        if self.session.has_pending_file_changes():
+            self._container.add_item(self._review_row)
         self._container.add_item(self._actions_row)
 
     def sync_layout(self) -> None:
@@ -863,6 +927,185 @@ class AgentChoiceSelect(discord.ui.Select):
                 description=self.parent_view.session._shorten(option.description, 100) if option.description else None,
             )
             for option in pending_choice.options[:25]
+        ]
+
+
+class AgentTaskReviewPopupView(discord.ui.View):
+    def __init__(self, session: AgentConversationSession) -> None:
+        super().__init__(timeout=900)
+        self.session = session
+        self._paths: list[str] = []
+        self._current_index = 0
+        self._file_select = AgentTaskReviewFileSelect(self)
+        self._revert_button = discord.ui.Button(label="回退", style=discord.ButtonStyle.danger)
+        self._revert_button.callback = self._on_revert
+        self._accept_button = discord.ui.Button(label="接受", style=discord.ButtonStyle.success)
+        self._accept_button.callback = self._on_accept
+        self._accept_all_button = discord.ui.Button(label="接受全部", style=discord.ButtonStyle.primary)
+        self._accept_all_button.callback = self._on_accept_all
+        self.add_item(self._file_select)
+        self.add_item(self._revert_button)
+        self.add_item(self._accept_button)
+        self.add_item(self._accept_all_button)
+        self._sync_paths()
+        self._sync_buttons()
+
+    def render_message(self) -> str:
+        self._sync_paths()
+        self._sync_buttons()
+        if not self._paths:
+            return "已沒有待確認變更。"
+        path = self._paths[self._current_index]
+        change = self.session.get_pending_file_change_diff(path)
+        status_map = {
+            "added": "新增",
+            "modified": "修改",
+            "deleted": "刪除",
+        }
+        header = "\n".join(
+            [
+                f"待確認變更 {self._current_index + 1}/{len(self._paths)}",
+                f"檔案：{path}",
+                f"類型：{status_map.get(str(change.get('status') or ''), '修改')}",
+            ]
+        )
+        diff_text = str(change.get("diff") or "(空白)").strip() or "(空白)"
+        max_diff_length = max(200, 1850 - len(header))
+        if len(diff_text) > max_diff_length:
+            diff_text = diff_text[: max_diff_length - 3] + "..."
+        return f"{header}\n```diff\n{diff_text}\n```"
+
+    def _sync_paths(self, preferred_path: str | None = None) -> None:
+        changes = self.session.list_pending_file_changes()
+        self._paths = [
+            str(item.get("path") or "")
+            for item in changes
+            if str(item.get("path") or "").strip()
+        ]
+        if not self._paths:
+            self._current_index = 0
+            return
+        if preferred_path and preferred_path in self._paths:
+            self._current_index = self._paths.index(preferred_path)
+            return
+        if self._current_index >= len(self._paths):
+            self._current_index = len(self._paths) - 1
+
+    def _sync_buttons(self) -> None:
+        has_items = bool(self._paths)
+        busy = self.session.is_busy()
+        self._file_select.sync_from_view()
+        self._revert_button.disabled = not has_items or busy
+        self._accept_button.disabled = not has_items or busy
+        self._accept_all_button.disabled = not has_items or busy
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.session.user.id:
+            return True
+        await interaction.response.send_message("只有原本的使用者可以操作這個對話。", ephemeral=True)
+        return False
+
+    async def _on_revert(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if self.session.is_busy():
+            await interaction.response.send_message("請等待目前執行完成後再處理變更。", ephemeral=True)
+            return
+        if not self._paths:
+            await interaction.response.edit_message(content="已沒有待確認變更。", view=None)
+            return
+        current_path = self._paths[self._current_index]
+        await self.session.revert_pending_file_change(current_path)
+        self._sync_paths(preferred_path=current_path)
+        self._sync_buttons()
+        if not self._paths:
+            await interaction.response.edit_message(content="已回退變更，且目前沒有待確認變更。", view=None)
+            return
+        await interaction.response.edit_message(content=self.render_message(), view=self)
+
+    async def _on_accept(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if self.session.is_busy():
+            await interaction.response.send_message("請等待目前執行完成後再處理變更。", ephemeral=True)
+            return
+        if not self._paths:
+            await interaction.response.edit_message(content="已沒有待確認變更。", view=None)
+            return
+        current_path = self._paths[self._current_index]
+        await self.session.accept_pending_file_change(current_path)
+        self._sync_paths(preferred_path=current_path)
+        self._sync_buttons()
+        if not self._paths:
+            await interaction.response.edit_message(content="已接受變更，且目前沒有待確認變更。", view=None)
+            return
+        await interaction.response.edit_message(content=self.render_message(), view=self)
+
+    async def _on_accept_all(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if self.session.is_busy():
+            await interaction.response.send_message("請等待目前執行完成後再處理變更。", ephemeral=True)
+            return
+        accepted = await self.session.accept_all_pending_file_changes()
+        self._paths = []
+        self._sync_buttons()
+        await interaction.response.edit_message(content=f"已接受全部變更，共 {accepted} 個檔案。", view=None)
+
+
+class AgentTaskReviewFileSelect(discord.ui.Select):
+    def __init__(self, parent_view: AgentTaskReviewPopupView) -> None:
+        super().__init__(
+            placeholder="選擇要檢視的檔案",
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label="目前沒有待確認變更", value="__none__")],
+            disabled=True,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.parent_view._ensure_owner(interaction):
+            return
+        if not self.parent_view._paths:
+            await interaction.response.edit_message(content="已沒有待確認變更。", view=None)
+            return
+        selected_value = self.values[0] if self.values else ""
+        if not selected_value.startswith("path:"):
+            await interaction.response.send_message("找不到對應的檔案選項。", ephemeral=True)
+            return
+        try:
+            selected_index = int(selected_value.removeprefix("path:"))
+        except ValueError:
+            await interaction.response.send_message("找不到對應的檔案選項。", ephemeral=True)
+            return
+        if selected_index < 0 or selected_index >= len(self.parent_view._paths):
+            await interaction.response.send_message("找不到對應的檔案選項。", ephemeral=True)
+            return
+        self.parent_view._current_index = selected_index
+        self.parent_view._sync_buttons()
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view if self.parent_view._paths else None,
+        )
+
+    def sync_from_view(self) -> None:
+        paths = self.parent_view._paths
+        if not paths:
+            self.disabled = True
+            self.placeholder = "目前沒有待確認變更"
+            self.options = [discord.SelectOption(label="目前沒有待確認變更", value="__none__")]
+            return
+
+        self.disabled = False
+        self.placeholder = "選擇要檢視的檔案"
+        self.options = [
+            discord.SelectOption(
+                label=self.parent_view.session._shorten(path, 100),
+                value=f"path:{index}",
+                default=index == self.parent_view._current_index,
+            )
+            for index, path in enumerate(paths[:25])
         ]
 
 

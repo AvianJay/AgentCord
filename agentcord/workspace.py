@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import io
 import json
 import py_compile
 import shutil
+import time
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -24,6 +26,8 @@ class WorkspaceError(ValueError):
 
 
 _DEFAULT_SYNC_IGNORE_PATTERNS = (
+    ".agentcord",
+    ".agentcord/*",
     ".git",
     ".hg",
     ".svn",
@@ -103,6 +107,208 @@ class WorkspaceManager:
 
     def default_sync_ignore_patterns(self) -> list[str]:
         return list(_DEFAULT_SYNC_IGNORE_PATTERNS)
+
+    def list_patch_target_paths(self, diff_text: str) -> list[str]:
+        file_diffs = self._parse_unified_diff(diff_text)
+        paths: list[str] = []
+        for file_diff in file_diffs:
+            old_path = str(file_diff.get("old_path") or "")
+            new_path = str(file_diff.get("new_path") or "")
+            target_path = new_path if new_path != "/dev/null" else old_path
+            if target_path and target_path != "/dev/null":
+                paths.append(target_path)
+        return paths
+
+    def list_all_files(self, user_id: int, path: str = ".") -> list[str]:
+        absolute = self._resolve_path(user_id, path)
+        if not absolute.exists():
+            raise WorkspaceError(f"找不到路徑：{path}")
+        if absolute.is_file():
+            return [self._to_relative(user_id, absolute)]
+
+        files: list[str] = []
+        for child in sorted(absolute.rglob("*")):
+            if child.is_file():
+                files.append(self._to_relative(user_id, child))
+        return files
+
+    def stage_task_file_changes(self, user_id: int, task_id: int, paths: list[str]) -> list[str]:
+        manifest = self._load_task_review_manifest(user_id, task_id)
+        entries = manifest["entries"]
+        tracked_paths = {str(entry.get("path") or "") for entry in entries if isinstance(entry, dict)}
+        updated_contents: dict[str, str | None] = {}
+        added_paths: list[str] = []
+
+        for raw_path in paths:
+            normalized_path = self._normalize_relative_path(str(raw_path or ""))
+            if normalized_path == "." or self._is_internal_review_path(normalized_path) or normalized_path in tracked_paths:
+                continue
+            absolute = self._resolve_path(user_id, normalized_path)
+            if absolute.exists() and absolute.is_dir():
+                raise WorkspaceError(f"只能追蹤檔案變更：{normalized_path}")
+
+            existed = absolute.exists()
+            snapshot_path = ""
+            if existed:
+                try:
+                    original_text = absolute.read_text(encoding="utf-8")
+                except UnicodeDecodeError as exc:
+                    raise WorkspaceError(f"只支援追蹤 UTF-8 文字檔變更：{normalized_path}") from exc
+                snapshot_path = self._task_review_snapshot_path(task_id, normalized_path)
+                updated_contents[snapshot_path] = original_text
+
+            entries.append(
+                {
+                    "path": normalized_path,
+                    "snapshot_path": snapshot_path,
+                    "existed": existed,
+                    "updated_at": time.time_ns(),
+                }
+            )
+            tracked_paths.add(normalized_path)
+            added_paths.append(normalized_path)
+
+        if not added_paths:
+            return []
+
+        updated_contents[self._task_review_manifest_path(task_id)] = self._serialize_task_review_manifest(entries)
+        self._write_patch_results(user_id, updated_contents)
+        return added_paths
+
+    def discard_task_file_changes(self, user_id: int, task_id: int, paths: list[str]) -> None:
+        self._remove_task_file_changes(user_id, task_id, paths)
+
+    def list_task_file_changes(self, user_id: int, task_id: int) -> list[dict[str, Any]]:
+        entries = self._load_task_review_manifest(user_id, task_id)["entries"]
+        results: list[dict[str, Any]] = []
+        for entry in sorted(entries, key=lambda item: (str(item.get("path") or ""))):
+            if not isinstance(entry, dict):
+                continue
+            path = self._normalize_relative_path(str(entry.get("path") or ""))
+            if path == ".":
+                continue
+            absolute = self._resolve_path(user_id, path)
+            current_exists = absolute.exists() and absolute.is_file()
+            existed = bool(entry.get("existed"))
+            status = "modified"
+            if existed and not current_exists:
+                status = "deleted"
+            elif not existed and current_exists:
+                status = "added"
+            results.append(
+                {
+                    "path": path,
+                    "snapshot_path": str(entry.get("snapshot_path") or ""),
+                    "existed": existed,
+                    "current_exists": current_exists,
+                    "status": status,
+                    "updated_at": int(entry.get("updated_at") or 0),
+                }
+            )
+        return results
+
+    def get_task_file_change_diff(
+        self,
+        user_id: int,
+        task_id: int,
+        path: str,
+        *,
+        context_lines: int = 3,
+    ) -> dict[str, Any]:
+        entry = self._get_task_review_entry(user_id, task_id, path)
+        normalized_path = self._normalize_relative_path(str(entry.get("path") or path))
+        existed = bool(entry.get("existed"))
+        before_text = ""
+        snapshot_path = str(entry.get("snapshot_path") or "")
+        if existed and snapshot_path:
+            before_text = self.read_file(user_id, snapshot_path)
+
+        absolute = self._resolve_path(user_id, normalized_path)
+        current_exists = absolute.exists() and absolute.is_file()
+        after_text = ""
+        if current_exists:
+            try:
+                after_text = absolute.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise WorkspaceError(f"只支援顯示 UTF-8 文字檔 diff：{normalized_path}") from exc
+
+        status = "modified"
+        if existed and not current_exists:
+            status = "deleted"
+        elif not existed and current_exists:
+            status = "added"
+
+        diff_text = "".join(
+            difflib.unified_diff(
+                before_text.splitlines(keepends=True),
+                after_text.splitlines(keepends=True),
+                fromfile=f"a/{normalized_path}" if existed else "/dev/null",
+                tofile=f"b/{normalized_path}" if current_exists else "/dev/null",
+                n=max(0, context_lines),
+            )
+        )
+        if not diff_text.strip():
+            diff_text = f"(目前沒有可顯示的文字差異：{normalized_path})"
+        return {
+            "path": normalized_path,
+            "status": status,
+            "diff": diff_text,
+            "current_exists": current_exists,
+            "existed": existed,
+        }
+
+    def accept_task_file_change(self, user_id: int, task_id: int, path: str) -> None:
+        self._remove_task_file_changes(user_id, task_id, [path])
+
+    def accept_all_task_file_changes(self, user_id: int, task_id: int) -> int:
+        entries = self.list_task_file_changes(user_id, task_id)
+        if not entries:
+            return 0
+        self._remove_task_file_changes(user_id, task_id, [str(entry.get("path") or "") for entry in entries])
+        return len(entries)
+
+    def clear_task_review_storage(self, user_id: int, task_id: int) -> None:
+        review_root = self._resolve_path(user_id, self._task_review_root_path(task_id))
+        if not review_root.exists():
+            return
+        shutil.rmtree(review_root, ignore_errors=True)
+        agent_root = review_root.parent
+        try:
+            if agent_root.exists() and not any(agent_root.iterdir()):
+                agent_root.rmdir()
+        except OSError:
+            return
+
+    def revert_task_file_change(self, user_id: int, task_id: int, path: str) -> None:
+        manifest = self._load_task_review_manifest(user_id, task_id)
+        entries = manifest["entries"]
+        normalized_path = self._normalize_relative_path(path)
+        entry = None
+        remaining_entries: list[dict[str, Any]] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            item_path = self._normalize_relative_path(str(item.get("path") or ""))
+            if item_path == normalized_path and entry is None:
+                entry = item
+                continue
+            remaining_entries.append(item)
+        if entry is None:
+            raise WorkspaceError(f"找不到待確認變更：{normalized_path}")
+
+        updated_contents: dict[str, str | None] = {}
+        existed = bool(entry.get("existed"))
+        snapshot_path = str(entry.get("snapshot_path") or "")
+        if existed:
+            if not snapshot_path:
+                raise WorkspaceError(f"缺少原始快照：{normalized_path}")
+            updated_contents[normalized_path] = self.read_file(user_id, snapshot_path)
+            updated_contents[snapshot_path] = None
+        else:
+            updated_contents[normalized_path] = None
+        self._apply_task_review_manifest_update(task_id, remaining_entries, updated_contents)
+        self._write_patch_results(user_id, updated_contents)
+        self._prune_task_review_storage(user_id, task_id)
 
     def collect_sync_candidates(
         self,
@@ -407,6 +613,127 @@ class WorkspaceManager:
                 continue
             absolute.parent.mkdir(parents=True, exist_ok=True)
             absolute.write_text(new_content, encoding="utf-8")
+
+    def _task_review_root_path(self, task_id: int) -> str:
+        return f".agentcord/task-{task_id}"
+
+    def _task_review_manifest_path(self, task_id: int) -> str:
+        return f"{self._task_review_root_path(task_id)}/manifest.json"
+
+    def _task_review_snapshot_path(self, task_id: int, path: str) -> str:
+        normalized_path = self._normalize_relative_path(path)
+        return f"{self._task_review_root_path(task_id)}/before/{normalized_path}"
+
+    def _load_task_review_manifest(self, user_id: int, task_id: int) -> dict[str, Any]:
+        manifest_path = self._task_review_manifest_path(task_id)
+        absolute = self._resolve_path(user_id, manifest_path)
+        if not absolute.exists():
+            return {"version": 1, "entries": []}
+        try:
+            payload = json.loads(absolute.read_text(encoding="utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            raise WorkspaceError(f"task-{task_id} 的變更快照 manifest 格式無效。") from exc
+        raw_entries = payload.get("entries") if isinstance(payload, dict) else []
+        entries = [entry for entry in raw_entries if isinstance(entry, dict)] if isinstance(raw_entries, list) else []
+        return {"version": 1, "entries": entries}
+
+    def _serialize_task_review_manifest(self, entries: list[dict[str, Any]]) -> str:
+        normalized_entries: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            path = self._normalize_relative_path(str(entry.get("path") or ""))
+            if path == ".":
+                continue
+            snapshot_path = str(entry.get("snapshot_path") or "").strip()
+            normalized_entries.append(
+                {
+                    "path": path,
+                    "snapshot_path": snapshot_path,
+                    "existed": bool(entry.get("existed")),
+                    "updated_at": int(entry.get("updated_at") or 0),
+                }
+            )
+        return json.dumps({"version": 1, "entries": normalized_entries}, ensure_ascii=False, indent=2)
+
+    def _apply_task_review_manifest_update(
+        self,
+        task_id: int,
+        entries: list[dict[str, Any]],
+        updated_contents: dict[str, str | None],
+    ) -> None:
+        manifest_path = self._task_review_manifest_path(task_id)
+        if entries:
+            updated_contents[manifest_path] = self._serialize_task_review_manifest(entries)
+            return
+        updated_contents[manifest_path] = None
+
+    def _get_task_review_entry(self, user_id: int, task_id: int, path: str) -> dict[str, Any]:
+        normalized_path = self._normalize_relative_path(path)
+        for entry in self._load_task_review_manifest(user_id, task_id)["entries"]:
+            if not isinstance(entry, dict):
+                continue
+            if self._normalize_relative_path(str(entry.get("path") or "")) == normalized_path:
+                return entry
+        raise WorkspaceError(f"找不到待確認變更：{normalized_path}")
+
+    def _remove_task_file_changes(self, user_id: int, task_id: int, paths: list[str]) -> None:
+        normalized_paths = {
+            self._normalize_relative_path(str(path or ""))
+            for path in paths
+            if str(path or "").strip()
+        }
+        if not normalized_paths:
+            return
+
+        manifest = self._load_task_review_manifest(user_id, task_id)
+        remaining_entries: list[dict[str, Any]] = []
+        removed_entries: list[dict[str, Any]] = []
+        for entry in manifest["entries"]:
+            if not isinstance(entry, dict):
+                continue
+            entry_path = self._normalize_relative_path(str(entry.get("path") or ""))
+            if entry_path in normalized_paths:
+                removed_entries.append(entry)
+                continue
+            remaining_entries.append(entry)
+
+        if not removed_entries:
+            return
+
+        updated_contents: dict[str, str | None] = {}
+        for entry in removed_entries:
+            snapshot_path = str(entry.get("snapshot_path") or "").strip()
+            if snapshot_path:
+                updated_contents[snapshot_path] = None
+        self._apply_task_review_manifest_update(task_id, remaining_entries, updated_contents)
+        self._write_patch_results(user_id, updated_contents)
+        self._prune_task_review_storage(user_id, task_id)
+
+    def _prune_task_review_storage(self, user_id: int, task_id: int) -> None:
+        review_root = self._resolve_path(user_id, self._task_review_root_path(task_id))
+        if not review_root.exists():
+            return
+        for current in sorted(review_root.rglob("*"), reverse=True):
+            if current.is_dir():
+                try:
+                    current.rmdir()
+                except OSError:
+                    continue
+        try:
+            review_root.rmdir()
+        except OSError:
+            return
+        agent_root = review_root.parent
+        try:
+            if agent_root.exists() and not any(agent_root.iterdir()):
+                agent_root.rmdir()
+        except OSError:
+            return
+
+    def _is_internal_review_path(self, path: str) -> bool:
+        normalized = self._normalize_relative_path(path).lower()
+        return normalized == ".agentcord" or normalized.startswith(".agentcord/")
 
     def _resolve_path(self, user_id: int, path: str) -> Path:
         relative = self._normalize_relative_path(path)

@@ -413,6 +413,7 @@ def register_commands(bot: AgentCordBot) -> None:
             if bot.agent_sessions.get(interaction.user.id) is existing_session:
                 bot.agent_sessions.pop(interaction.user.id, None)
 
+        bot.workspace.clear_task_review_storage(interaction.user.id, task_id)
         deleted_task = bot.db.delete_task(interaction.user.id, task_id)
         await log_interaction(
             interaction,

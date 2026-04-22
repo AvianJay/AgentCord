@@ -36,6 +36,10 @@ _CURRENT_CONVERSATION_MESSAGES: contextvars.ContextVar[list[ConversationMessage]
     "agentcord_current_conversation_messages",
     default=None,
 )
+_CURRENT_TASK_ID: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "agentcord_current_task_id",
+    default=None,
+)
 
 
 @dataclass(slots=True)
@@ -167,6 +171,7 @@ class CodingAgent:
             )
 
         conversation_token = _CURRENT_CONVERSATION_MESSAGES.set(history_messages)
+        task_token = _CURRENT_TASK_ID.set(task.id)
         try:
             await self._emit_progress(
                 progress_callback,
@@ -308,6 +313,7 @@ class CodingAgent:
                 task_id=task.id,
             )
         finally:
+            _CURRENT_TASK_ID.reset(task_token)
             _CURRENT_CONVERSATION_MESSAGES.reset(conversation_token)
 
     async def plan(
@@ -1037,7 +1043,12 @@ class CodingAgent:
         del progress_callback
         path = self._require_string_argument(action, "path")
         content = self._require_string_argument(action, "content", allow_empty=True)
-        self.workspace.write_file(user_id, path, content)
+        staged_paths = self._stage_task_file_changes(user_id, [path])
+        try:
+            self.workspace.write_file(user_id, path, content)
+        except Exception:
+            self._discard_task_file_changes(user_id, staged_paths)
+            raise
         return ({"path": path, "result": "ok"}, [path], current_task_items)
 
     async def _tool_apply_patch(
@@ -1049,7 +1060,13 @@ class CodingAgent:
     ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
         del progress_callback
         diff = self._require_string_argument(action, "diff", allow_empty=True)
-        changed = self.workspace.apply_patch(user_id, diff)
+        target_paths = self.workspace.list_patch_target_paths(diff)
+        staged_paths = self._stage_task_file_changes(user_id, target_paths)
+        try:
+            changed = self.workspace.apply_patch(user_id, diff)
+        except Exception:
+            self._discard_task_file_changes(user_id, staged_paths)
+            raise
         return ({"result": changed}, changed, current_task_items)
 
     async def _tool_delete_file(
@@ -1061,7 +1078,12 @@ class CodingAgent:
     ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
         del progress_callback
         path = self._require_string_argument(action, "path")
-        self.workspace.delete_file(user_id, path)
+        staged_paths = self._stage_task_file_changes(user_id, [path])
+        try:
+            self.workspace.delete_file(user_id, path)
+        except Exception:
+            self._discard_task_file_changes(user_id, staged_paths)
+            raise
         return ({"path": path, "result": "ok"}, [path], current_task_items)
 
     async def _tool_create_folder(
@@ -1086,7 +1108,15 @@ class CodingAgent:
         del progress_callback
         path = self._require_string_argument(action, "path")
         force = self._coerce_bool(action.get("force"), default=False)
-        removed_path = self.workspace.remove_folder(user_id, path, force=force)
+        staged_paths = self._stage_task_file_changes(
+            user_id,
+            self.workspace.list_all_files(user_id, path) if force else [],
+        )
+        try:
+            removed_path = self.workspace.remove_folder(user_id, path, force=force)
+        except Exception:
+            self._discard_task_file_changes(user_id, staged_paths)
+            raise
         return ({"path": removed_path, "force": force, "result": "ok"}, [removed_path], current_task_items)
 
     async def _tool_py_compile_check(
@@ -1485,14 +1515,19 @@ class CodingAgent:
             for item in files:
                 remote_file_path = str(item["remote_path"])
                 workspace_path = str(item["workspace_path"])
-                content = await read_pterodactyl_server_file(
-                    self.session,
-                    self.settings,
-                    config,
-                    server,
-                    remote_file_path,
-                )
-                self.workspace.write_file(user_id, workspace_path, content)
+                staged_paths = self._stage_task_file_changes(user_id, [workspace_path])
+                try:
+                    content = await read_pterodactyl_server_file(
+                        self.session,
+                        self.settings,
+                        config,
+                        server,
+                        remote_file_path,
+                    )
+                    self.workspace.write_file(user_id, workspace_path, content)
+                except Exception:
+                    self._discard_task_file_changes(user_id, staged_paths)
+                    raise
                 touched_files.append(workspace_path)
                 if len(pulled_preview) < 50:
                     pulled_preview.append(
@@ -1616,6 +1651,22 @@ class CodingAgent:
         if not allow_empty and not value.strip():
             raise ValueError(f"工具 {action.get('tool')} 缺少字串參數：{key}。")
         return value if allow_empty else value.strip()
+
+    def _require_active_task_id(self) -> int:
+        task_id = _CURRENT_TASK_ID.get()
+        if task_id is None:
+            raise ValueError("目前沒有可追蹤變更的 task。")
+        return task_id
+
+    def _stage_task_file_changes(self, user_id: int, paths: list[str]) -> list[str]:
+        if not paths:
+            return []
+        return self.workspace.stage_task_file_changes(user_id, self._require_active_task_id(), paths)
+
+    def _discard_task_file_changes(self, user_id: int, paths: list[str]) -> None:
+        if not paths:
+            return
+        self.workspace.discard_task_file_changes(user_id, self._require_active_task_id(), paths)
 
     def _require_string_argument_with_aliases(
         self,
