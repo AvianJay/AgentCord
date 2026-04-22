@@ -427,6 +427,123 @@ async def create_pterodactyl_server_folder(
         raise
 
 
+async def list_pterodactyl_server_directory(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    config: UserPterodactylConfig,
+    server: str,
+    path: str,
+) -> list[dict[str, Any]]:
+    normalized_path = normalize_pterodactyl_server_path(path)
+    response = await request_pterodactyl_client_api(
+        session,
+        settings,
+        config,
+        "GET",
+        f"/servers/{server}/files/list",
+        query={"directory": normalized_path},
+        expect="json",
+    )
+
+    raw_items: Any = None
+    if isinstance(response.data, dict):
+        if isinstance(response.data.get("data"), list):
+            raw_items = response.data.get("data")
+        elif isinstance(response.data.get("files"), list):
+            raw_items = response.data.get("files")
+    elif isinstance(response.data, list):
+        raw_items = response.data
+    if not isinstance(raw_items, list):
+        raise PterodactylError("Pterodactyl 檔案列表回應格式無效。")
+
+    entries: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else item
+        if not isinstance(attributes, dict):
+            continue
+        name = str(attributes.get("name") or attributes.get("filename") or "").strip()
+        if not name:
+            continue
+        raw_is_file = attributes.get("is_file")
+        if isinstance(raw_is_file, bool):
+            kind = "file" if raw_is_file else "folder"
+        else:
+            mimetype = str(attributes.get("mimetype") or "").strip().lower()
+            kind = "folder" if mimetype in {"inode/directory", "directory"} else "file"
+        size_value = attributes.get("size", 0)
+        size = size_value if isinstance(size_value, int) and size_value >= 0 else 0
+        entries.append(
+            {
+                "name": name,
+                "kind": kind,
+                "size": size,
+                "mimetype": str(attributes.get("mimetype") or "").strip(),
+            }
+        )
+    return entries
+
+
+async def collect_pterodactyl_server_files(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    config: UserPterodactylConfig,
+    server: str,
+    path: str,
+) -> dict[str, Any]:
+    normalized_path = normalize_pterodactyl_server_path(path)
+    files: list[dict[str, Any]] = []
+
+    async def visit(directory_path: str, prefix: str) -> None:
+        entries = await list_pterodactyl_server_directory(session, settings, config, server, directory_path)
+        for entry in entries:
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            remote_item_path = join_pterodactyl_server_path(directory_path, name)
+            relative_path = name if not prefix else f"{prefix}/{name}"
+            if entry.get("kind") == "folder":
+                await visit(remote_item_path, relative_path)
+                continue
+            files.append(
+                {
+                    "remote_path": remote_item_path,
+                    "relative_path": relative_path,
+                    "size": int(entry.get("size") or 0),
+                    "mimetype": str(entry.get("mimetype") or "").strip(),
+                }
+            )
+
+    try:
+        await visit(normalized_path, "")
+        return {
+            "source_path": normalized_path,
+            "source_kind": "folder",
+            "files": files,
+        }
+    except PterodactylError as exc:
+        if normalized_path == "/":
+            raise
+        try:
+            content = await read_pterodactyl_server_file(session, settings, config, server, normalized_path)
+        except PterodactylError:
+            raise exc
+        file_name = PurePosixPath(normalized_path).name or "file"
+        return {
+            "source_path": normalized_path,
+            "source_kind": "file",
+            "files": [
+                {
+                    "remote_path": normalized_path,
+                    "relative_path": file_name,
+                    "size": len(content.encode("utf-8")),
+                    "mimetype": "text/plain",
+                }
+            ],
+        }
+
+
 async def get_pterodactyl_websocket_credentials(
     session: aiohttp.ClientSession,
     settings: Settings,

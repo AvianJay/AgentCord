@@ -158,6 +158,77 @@ class WorkspaceManager:
             "ignore_patterns": sorted(active_patterns),
         }
 
+    def collect_remote_sync_targets(
+        self,
+        user_id: int,
+        path: str = ".",
+        *,
+        remote_files: list[dict[str, Any]],
+        ignore_patterns: list[str] | None = None,
+    ) -> dict[str, Any]:
+        absolute = self._resolve_path(user_id, path)
+        if absolute.exists() and absolute.is_file():
+            raise WorkspaceError("同步目的地路徑必須是資料夾。")
+
+        current_total = self.total_size(user_id)
+        if current_total > self._limit_bytes:
+            raise WorkspaceError(
+                f"同步遭拒：工作區目前大小 {current_total} 位元組，已超過 {self._limit_bytes} 位元組上限。"
+            )
+
+        root = self.user_root(user_id)
+        target_root_relative = "." if absolute == root else absolute.relative_to(root).as_posix()
+        active_patterns = self._build_ignore_pattern_set(ignore_patterns)
+        files: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        existing_sizes: dict[str, int] = {}
+        incoming_total = 0
+
+        for item in remote_files:
+            relative_path = self._normalize_relative_path(str(item.get("relative_path") or ""))
+            if relative_path == ".":
+                continue
+            workspace_path = relative_path if target_root_relative == "." else f"{target_root_relative}/{relative_path}"
+            if self._should_ignore_sync_path(
+                workspace_path,
+                relative_path,
+                is_dir=False,
+                ignore_patterns=active_patterns,
+            ):
+                skipped.append({"path": workspace_path, "reason": "ignored"})
+                continue
+            remote_path = str(item.get("remote_path") or "").strip()
+            size_value = item.get("size", 0)
+            size = size_value if isinstance(size_value, int) and size_value >= 0 else 0
+            files.append(
+                {
+                    "workspace_path": workspace_path,
+                    "relative_path": relative_path,
+                    "remote_path": remote_path,
+                    "size": size,
+                    "mimetype": str(item.get("mimetype") or "").strip(),
+                }
+            )
+            absolute_target = self._resolve_path(user_id, workspace_path)
+            existing_sizes[workspace_path] = absolute_target.stat().st_size if absolute_target.exists() else 0
+            incoming_total += size
+
+        projected_total = current_total - sum(existing_sizes.values()) + incoming_total
+        if projected_total > self._limit_bytes:
+            raise WorkspaceError(
+                f"同步遭拒：拉取後工作區將超過 {self._limit_bytes} 位元組上限。"
+            )
+
+        return {
+            "target_path": target_root_relative,
+            "total_size": current_total,
+            "projected_total": projected_total,
+            "limit_bytes": self._limit_bytes,
+            "files": files,
+            "skipped": skipped,
+            "ignore_patterns": sorted(active_patterns),
+        }
+
     def delete_file(self, user_id: int, path: str) -> None:
         absolute = self._resolve_path(user_id, path)
         if absolute.is_dir():

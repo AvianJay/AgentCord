@@ -14,6 +14,7 @@ from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.models import AIUsage, AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
 from agentcord.pterodactyl import (
+    collect_pterodactyl_server_files,
     create_pterodactyl_server_folder,
     get_pterodactyl_startup,
     join_pterodactyl_server_path,
@@ -716,7 +717,8 @@ class CodingAgent:
             AgentToolSpec(
                 name="pterodactyl_sync_workspace",
                 description=(
-                    "把目前 agent 工作區中的文字檔同步到指定伺服器路徑。"
+                    "在目前 agent 工作區與指定 Pterodactyl 伺服器路徑之間同步文字檔。"
+                    "可用 direction=push 把工作區推到伺服器，或 direction=pull 把伺服器拉回工作區。"
                     "會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄，"
                     "也可以額外提供 ignore_patterns。"
                 ),
@@ -724,8 +726,13 @@ class CodingAgent:
                     "type": "object",
                     "properties": {
                         "server": {"type": "string", "description": "Pterodactyl server identifier。"},
-                        "path": {"type": "string", "description": "工作區內要同步的來源路徑，預設為 .。"},
-                        "remote_path": {"type": "string", "description": "伺服器上的目標資料夾，預設為 /。"},
+                        "direction": {
+                            "type": "string",
+                            "description": "同步方向：push=工作區到伺服器；pull=伺服器到工作區。預設 push。",
+                            "enum": ["push", "pull"],
+                        },
+                        "path": {"type": "string", "description": "工作區端路徑。push 時為來源；pull 時為目標資料夾。預設為 .。"},
+                        "remote_path": {"type": "string", "description": "伺服器端路徑。push 時為目標；pull 時為來源。預設為 /。"},
                         "ignore_patterns": {
                             "type": "array",
                             "description": "額外忽略規則，例如 ['coverage', '*.log']。",
@@ -1329,75 +1336,167 @@ class CodingAgent:
     ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
         del progress_callback
         server = self._require_string_argument(action, "server")
+        direction = str(action.get("direction") or "push").strip().lower() or "push"
+        if direction not in {"push", "pull"}:
+            raise ValueError("工具 pterodactyl_sync_workspace 的 direction 只能是 push 或 pull。")
         source_path = str(action.get("path") or ".").strip() or "."
         remote_path = str(action.get("remote_path") or "/").strip() or "/"
         dry_run = self._coerce_bool(action.get("dry_run"), default=False)
         ignore_patterns = self._optional_string_list_argument(action, "ignore_patterns")
-        manifest = self.workspace.collect_sync_candidates(
+        config = self.db.get_pterodactyl_config(user_id)
+        if direction == "push":
+            manifest = self.workspace.collect_sync_candidates(
+                user_id,
+                source_path,
+                ignore_patterns=ignore_patterns,
+            )
+            files = [item for item in manifest["files"] if isinstance(item, dict)]
+            synced_preview: list[dict[str, Any]] = []
+            remote_directories = sorted(
+                {
+                    join_pterodactyl_server_path(remote_path, item["relative_path"].rsplit("/", 1)[0])
+                    for item in files
+                    if isinstance(item.get("relative_path"), str) and "/" in item["relative_path"]
+                },
+                key=lambda value: (value.count("/"), value),
+            )
+            if not dry_run:
+                for directory in remote_directories:
+                    await create_pterodactyl_server_folder(self.session, self.settings, config, server, directory)
+                for item in files:
+                    workspace_path = str(item["workspace_path"])
+                    relative_path = str(item["relative_path"])
+                    remote_file_path = join_pterodactyl_server_path(remote_path, relative_path)
+                    content = self.workspace.read_file(user_id, workspace_path)
+                    await write_pterodactyl_server_file(
+                        self.session,
+                        self.settings,
+                        config,
+                        server,
+                        remote_file_path,
+                        content,
+                    )
+                    if len(synced_preview) < 50:
+                        synced_preview.append(
+                            {
+                                "workspace_path": workspace_path,
+                                "remote_path": remote_file_path,
+                                "size": item.get("size", 0),
+                            }
+                        )
+            return (
+                {
+                    "server": server,
+                    "direction": direction,
+                    "source_path": manifest["source_path"],
+                    "remote_path": remote_path,
+                    "dry_run": dry_run,
+                    "workspace_total_size": manifest["total_size"],
+                    "workspace_limit_bytes": manifest["limit_bytes"],
+                    "ignore_patterns": manifest["ignore_patterns"],
+                    "file_count": len(files),
+                    "skipped_count": len(manifest["skipped"]),
+                    "files_preview": [
+                        {
+                            "workspace_path": str(item["workspace_path"]),
+                            "relative_path": str(item["relative_path"]),
+                            "size": item.get("size", 0),
+                        }
+                        for item in files[:50]
+                    ]
+                    if dry_run
+                    else synced_preview,
+                    "skipped_preview": manifest["skipped"][:50],
+                },
+                [],
+                current_task_items,
+            )
+
+        remote_manifest = await collect_pterodactyl_server_files(
+            self.session,
+            self.settings,
+            config,
+            server,
+            remote_path,
+        )
+        text_like_remote_files = []
+        skipped_remote_files: list[dict[str, str]] = []
+        for item in remote_manifest["files"]:
+            if not isinstance(item, dict):
+                continue
+            mimetype = str(item.get("mimetype") or "").strip().lower()
+            if mimetype and not self._is_text_like_mimetype(mimetype):
+                skipped_remote_files.append(
+                    {
+                        "path": str(item.get("remote_path") or item.get("relative_path") or ""),
+                        "reason": "non-text",
+                    }
+                )
+                continue
+            text_like_remote_files.append(item)
+
+        manifest = self.workspace.collect_remote_sync_targets(
             user_id,
             source_path,
+            remote_files=text_like_remote_files,
             ignore_patterns=ignore_patterns,
         )
-
         files = [item for item in manifest["files"] if isinstance(item, dict)]
-        synced_preview: list[dict[str, Any]] = []
-        config = self.db.get_pterodactyl_config(user_id)
-        remote_directories = sorted(
-            {
-                join_pterodactyl_server_path(remote_path, item["relative_path"].rsplit("/", 1)[0])
-                for item in files
-                if isinstance(item.get("relative_path"), str) and "/" in item["relative_path"]
-            },
-            key=lambda value: (value.count("/"), value),
-        )
+        pulled_preview: list[dict[str, Any]] = []
+        touched_files: list[str] = []
         if not dry_run:
-            for directory in remote_directories:
-                await create_pterodactyl_server_folder(self.session, self.settings, config, server, directory)
             for item in files:
+                remote_file_path = str(item["remote_path"])
                 workspace_path = str(item["workspace_path"])
-                relative_path = str(item["relative_path"])
-                remote_file_path = join_pterodactyl_server_path(remote_path, relative_path)
-                content = self.workspace.read_file(user_id, workspace_path)
-                await write_pterodactyl_server_file(
+                content = await read_pterodactyl_server_file(
                     self.session,
                     self.settings,
                     config,
                     server,
                     remote_file_path,
-                    content,
                 )
-                if len(synced_preview) < 50:
-                    synced_preview.append(
+                self.workspace.write_file(user_id, workspace_path, content)
+                touched_files.append(workspace_path)
+                if len(pulled_preview) < 50:
+                    pulled_preview.append(
                         {
                             "workspace_path": workspace_path,
                             "remote_path": remote_file_path,
                             "size": item.get("size", 0),
                         }
                     )
+        skipped_preview = [*manifest["skipped"][:50]]
+        remaining_slots = max(0, 50 - len(skipped_preview))
+        if remaining_slots:
+            skipped_preview.extend(skipped_remote_files[:remaining_slots])
         return (
             {
                 "server": server,
-                "source_path": manifest["source_path"],
-                "remote_path": remote_path,
+                "direction": direction,
+                "workspace_path": manifest["target_path"],
+                "remote_path": remote_manifest["source_path"],
+                "remote_source_kind": remote_manifest["source_kind"],
                 "dry_run": dry_run,
                 "workspace_total_size": manifest["total_size"],
+                "workspace_projected_total": manifest["projected_total"],
                 "workspace_limit_bytes": manifest["limit_bytes"],
                 "ignore_patterns": manifest["ignore_patterns"],
                 "file_count": len(files),
-                "skipped_count": len(manifest["skipped"]),
+                "skipped_count": len(manifest["skipped"]) + len(skipped_remote_files),
                 "files_preview": [
                     {
                         "workspace_path": str(item["workspace_path"]),
+                        "remote_path": str(item["remote_path"]),
                         "relative_path": str(item["relative_path"]),
                         "size": item.get("size", 0),
                     }
                     for item in files[:50]
                 ]
                 if dry_run
-                else synced_preview,
-                "skipped_preview": manifest["skipped"][:50],
+                else pulled_preview,
+                "skipped_preview": skipped_preview,
             },
-            [],
+            touched_files,
             current_task_items,
         )
 
@@ -1654,6 +1753,23 @@ class CodingAgent:
             raise ValueError(f"工具 {action.get('tool')} 的 {key} 不能大於 {maximum}。")
         return number
 
+    @staticmethod
+    def _is_text_like_mimetype(mimetype: str) -> bool:
+        normalized = mimetype.strip().lower()
+        if not normalized:
+            return True
+        if normalized.startswith("text/"):
+            return True
+        return normalized in {
+            "application/json",
+            "application/javascript",
+            "application/xml",
+            "application/yaml",
+            "application/x-yaml",
+            "application/toml",
+            "inode/x-empty",
+        }
+
     def _require_number_argument(
         self,
         action: dict[str, Any],
@@ -1860,7 +1976,7 @@ class CodingAgent:
             "pterodactyl_read_console": "讀取 console",
             "pterodactyl_read_server_file": "讀取伺服器檔案",
             "pterodactyl_write_server_file": "寫入伺服器檔案",
-            "pterodactyl_sync_workspace": "同步工作區到伺服器",
+            "pterodactyl_sync_workspace": "同步工作區與伺服器",
             "pterodactyl_request": "Pterodactyl API 請求",
             "tasks": "更新 tasks 清單",
         }
@@ -1910,6 +2026,9 @@ class CodingAgent:
         if tool_name == "pterodactyl_write_server_file":
             return f"寫入伺服器檔案中：{action.get('server', '')} {action.get('path', '')}"
         if tool_name == "pterodactyl_sync_workspace":
+            direction = str(action.get("direction") or "push").lower()
+            if direction == "pull":
+                return f"同步伺服器到工作區中：{action.get('server', '')} {action.get('remote_path', '/') }"
             return f"同步工作區到伺服器中：{action.get('server', '')} {action.get('remote_path', '/') }"
         if tool_name == "pterodactyl_request":
             return f"Pterodactyl API 請求中：{str(action.get('method', '')).upper()} {action.get('path', '/') }"
@@ -1944,6 +2063,9 @@ class CodingAgent:
         }:
             return f"{self._format_tool_label(tool_name)}已完成：{action.get('server', '')}"
         if tool_name == "pterodactyl_sync_workspace":
+            direction = str(action.get("direction") or "push").lower()
+            if direction == "pull":
+                return f"同步伺服器到工作區已完成：{action.get('server', '')}"
             return f"同步工作區到伺服器已完成：{action.get('server', '')}"
         if tool_name == "pterodactyl_request":
             return f"Pterodactyl API 請求已完成：{str(action.get('method', '')).upper()} {action.get('path', '/') }"
@@ -2021,7 +2143,7 @@ _AGENT_SYSTEM_PROMPT_PREFIX = """
 - 可使用 send_message 在執行中直接對使用者說明你正在做什麼、遇到什麼情況、或通知下一步。
 - 若需要使用者做明確決策，請使用 ask_user_choice，而不是自己猜測。它支援單選、多選與自由輸入，收到回覆後再繼續操作。
 - 若使用者已透過 /set-pterodactyl 設定 Pterodactyl Client API，可使用 pterodactyl_request 查詢或操作其有權限的伺服器資源。
-- pterodactyl_sync_workspace 會自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄；如有需要可額外提供 ignore_patterns。
+- pterodactyl_sync_workspace 可將工作區推到伺服器，也可從伺服器拉回工作區；兩個方向都會套用 ignore_patterns，並自動忽略 .venv、venv、node_modules、__pycache__ 等大型或衍生目錄。
 - pterodactyl_read_console 只能擷取建立連線後的 live 輸出；若要觀察啟動過程，請在 power_action 後立刻呼叫，必要時再搭配 sleep。
 - 如果目前工作有明確步驟，請使用 tasks 工具更新工作清單，好讓使用者看到目前進度。
 """

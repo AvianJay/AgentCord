@@ -40,6 +40,14 @@ class ConversationEntry:
 
 
 @dataclass(slots=True)
+class DisplayEntry:
+    kind: str
+    text: str
+    key: str | None = None
+    transient: bool = False
+
+
+@dataclass(slots=True)
 class ChoiceOptionEntry:
     label: str
     value: str
@@ -66,6 +74,7 @@ class AgentConversationSession:
         self.guild: discord.Guild | None = None
         self.task_items = list(task.task_items)
         self._conversation_entries: deque[ConversationEntry] = deque(self._load_conversation_entries(task.messages))
+        self._display_entries: deque[DisplayEntry] = deque(self._load_display_entries(task.messages))
         self._pending_choice: PendingChoiceState | None = None
         self.context_state = ContextWindowState(
             model=task.model,
@@ -333,9 +342,7 @@ class AgentConversationSession:
         return self._render_main_display()
 
     def _render_main_display(self) -> str:
-        conversation_lines = [self._format_conversation_entry(entry) for entry in self._conversation_entries]
-        activity_lines = [f"-# {entry.text}" for entry in self._activity_lines] or ["-# 等待新的 agent 訊息。"]
-        lines = [*conversation_lines, *activity_lines] or ["(無)"]
+        lines = [entry.text for entry in self._display_entries] or ["-# 等待新的 agent 訊息。"]
         content = self._compose_main_display(lines)
         while len(content) > _MESSAGE_LIMIT and len(lines) > 1:
             lines = lines[1:]
@@ -433,6 +440,22 @@ class AgentConversationSession:
             entries.append(ConversationEntry(role=message.role, text=normalized))
         return entries
 
+    def _load_display_entries(self, messages: list[ConversationMessage]) -> list[DisplayEntry]:
+        entries: list[DisplayEntry] = []
+        for message in messages:
+            if message.role not in {"user", "assistant"}:
+                continue
+            normalized = str(message.content).strip()
+            if not normalized:
+                continue
+            entries.append(
+                DisplayEntry(
+                    kind="conversation",
+                    text=self._format_conversation_text(message.role, normalized),
+                )
+            )
+        return entries
+
     def _build_persisted_messages(self) -> list[ConversationMessage]:
         system_messages = [message for message in self.task_record.messages if message.role == "system"]
         conversation_messages = [
@@ -450,10 +473,19 @@ class AgentConversationSession:
             if last_entry.role == role and last_entry.text == normalized:
                 return
         self._conversation_entries.append(ConversationEntry(role=role, text=normalized))
+        formatted = self._format_conversation_text(role, normalized)
+        if self._display_entries:
+            last_entry = self._display_entries[-1]
+            if last_entry.kind == "conversation" and last_entry.text == formatted:
+                return
+        self._display_entries.append(DisplayEntry(kind="conversation", text=formatted))
 
     def _format_conversation_entry(self, entry: ConversationEntry) -> str:
-        formatted = self._shorten(" ".join(entry.text.split()), 220)
-        if entry.role == "user":
+        return self._format_conversation_text(entry.role, entry.text)
+
+    def _format_conversation_text(self, role: str, text: str) -> str:
+        formatted = self._shorten(" ".join(text.split()), 220)
+        if role == "user":
             return f"> {formatted}"
         return formatted
 
@@ -578,6 +610,7 @@ class AgentConversationSession:
         if not normalized:
             return
         normalized = self._shorten(normalized, 180)
+        display_text = f"-# {normalized}"
         if key is not None:
             for entry in self._activity_lines:
                 if entry.key != key:
@@ -586,6 +619,7 @@ class AgentConversationSession:
                     return
                 entry.text = normalized
                 entry.transient = transient
+                self._upsert_display_activity(display_text, key=key, transient=transient)
                 return
         elif transient is False:
             self._clear_transient_activities()
@@ -594,17 +628,33 @@ class AgentConversationSession:
                 if last_entry.key is None and last_entry.text == normalized:
                     return
         self._activity_lines.append(ActivityEntry(text=normalized, key=key, transient=transient))
+        self._upsert_display_activity(display_text, key=key, transient=transient)
 
     def _clear_transient_activities(self) -> None:
-        if not self._activity_lines:
-            return
-        retained_entries = [entry for entry in self._activity_lines if not entry.transient]
-        self._activity_lines = deque(retained_entries)
+        if self._activity_lines:
+            retained_entries = [entry for entry in self._activity_lines if not entry.transient]
+            self._activity_lines = deque(retained_entries)
+        self._display_entries = deque(entry for entry in self._display_entries if not entry.transient)
 
     def _remove_activity(self, key: str | None) -> None:
         if key is None or not self._activity_lines:
             return
         self._activity_lines = deque(entry for entry in self._activity_lines if entry.key != key)
+        self._display_entries = deque(entry for entry in self._display_entries if entry.key != key)
+
+    def _upsert_display_activity(self, text: str, *, key: str | None, transient: bool) -> None:
+        if key is not None:
+            for entry in self._display_entries:
+                if entry.kind != "activity" or entry.key != key:
+                    continue
+                entry.text = text
+                entry.transient = transient
+                return
+        elif transient is False and self._display_entries:
+            last_entry = self._display_entries[-1]
+            if last_entry.kind == "activity" and last_entry.key is None and last_entry.text == text:
+                return
+        self._display_entries.append(DisplayEntry(kind="activity", text=text, key=key, transient=transient))
 
     def _scope_activity_key(self, key: str | None) -> str | None:
         if key is None or self._active_run_scope is None:
