@@ -38,6 +38,24 @@ class AgentPlanResult:
     usage: AIUsage | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AgentToolSpec:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    handler_name: str
+
+    def as_function_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+
 class CreditManager:
     def __init__(self, db: Database, settings: Settings) -> None:
         self.db = db
@@ -71,6 +89,8 @@ class CodingAgent:
         self.workspace = workspace
         self.session = session
         self.credits = CreditManager(db, settings)
+        self._tool_aliases = {"rmdir": "remove_folder"}
+        self._tool_specs = {spec.name: spec for spec in self._build_tool_specs()}
 
     async def run(
         self,
@@ -162,7 +182,7 @@ class CodingAgent:
             )
             step_response = await provider.stream_generate(
                 [
-                    {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
+                    {"role": "system", "content": self._build_agent_system_prompt()},
                     {"role": "user", "content": context},
                 ],
                 on_delta=self._build_stream_progress_callback(
@@ -189,7 +209,7 @@ class CodingAgent:
             await self._remove_activity(progress_callback, activity_key=f"decision:{iteration}")
             tool_results, touched_files, current_task_items = await self._execute_actions(
                 user_id,
-                decision.get("actions", []),
+                self._extract_decision_actions(decision),
                 current_task_items,
                 progress_callback,
                 iteration,
@@ -387,6 +407,268 @@ class CodingAgent:
             f"actions 最多只能有 {self.settings.agent_max_actions_per_iteration} 個。"
         )
 
+    def _build_tool_specs(self) -> list[AgentToolSpec]:
+        return [
+            AgentToolSpec(
+                name="list_files",
+                description="列出工作區路徑下的檔案或資料夾。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "工作區相對路徑，預設為 ."},
+                    },
+                },
+                handler_name="_tool_list_files",
+            ),
+            AgentToolSpec(
+                name="read_file",
+                description="讀取 UTF-8 文字檔內容。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要讀取的工作區檔案路徑。"},
+                    },
+                    "required": ["path"],
+                },
+                handler_name="_tool_read_file",
+            ),
+            AgentToolSpec(
+                name="write_file",
+                description="直接寫入完整檔案內容；若是修改既有檔案，通常應優先使用 apply_patch。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要寫入的工作區檔案路徑。"},
+                        "content": {"type": "string", "description": "完整 UTF-8 文字內容。"},
+                    },
+                    "required": ["path", "content"],
+                },
+                handler_name="_tool_write_file",
+            ),
+            AgentToolSpec(
+                name="apply_patch",
+                description="以 unified diff / patch 形式修改既有檔案。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "diff": {"type": "string", "description": "要套用的 unified diff。"},
+                    },
+                    "required": ["diff"],
+                },
+                handler_name="_tool_apply_patch",
+            ),
+            AgentToolSpec(
+                name="delete_file",
+                description="刪除單一檔案。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要刪除的工作區檔案路徑。"},
+                    },
+                    "required": ["path"],
+                },
+                handler_name="_tool_delete_file",
+            ),
+            AgentToolSpec(
+                name="create_folder",
+                description="建立資料夾。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要建立的工作區資料夾路徑。"},
+                    },
+                    "required": ["path"],
+                },
+                handler_name="_tool_create_folder",
+            ),
+            AgentToolSpec(
+                name="remove_folder",
+                description="刪除資料夾；force=true 時可遞迴刪除非空資料夾。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要刪除的工作區資料夾路徑。"},
+                        "force": {"type": "boolean", "description": "是否遞迴刪除非空資料夾。"},
+                    },
+                    "required": ["path"],
+                },
+                handler_name="_tool_remove_folder",
+            ),
+            AgentToolSpec(
+                name="py_compile_check",
+                description="對 Python 檔案做語法檢查。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要檢查的 Python 檔案路徑。"},
+                    },
+                    "required": ["path"],
+                },
+                handler_name="_tool_py_compile_check",
+            ),
+            AgentToolSpec(
+                name="search_web",
+                description="搜尋網路並回傳結構化結果。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜尋關鍵字。"},
+                    },
+                    "required": ["query"],
+                },
+                handler_name="_tool_search_web",
+            ),
+            AgentToolSpec(
+                name="fetch_url",
+                description="抓取公開網址的內容。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "要抓取的完整 URL。"},
+                    },
+                    "required": ["url"],
+                },
+                handler_name="_tool_fetch_url",
+            ),
+            AgentToolSpec(
+                name="tasks",
+                description="更新目前工作清單，讓使用者看到進度。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": "task 清單。",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "text": {"type": "string"},
+                                    "status": {"type": "string"},
+                                    "done": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                    "required": ["items"],
+                },
+                handler_name="_tool_tasks",
+            ),
+        ]
+
+    def _build_ai_tools(self) -> list[dict[str, Any]]:
+        return [spec.as_function_schema() for spec in self._tool_specs.values()]
+
+    def _build_agent_system_prompt(self) -> str:
+        tool_schema = json.dumps(self._build_ai_tools(), ensure_ascii=False, indent=2)
+        return (
+            _AGENT_SYSTEM_PROMPT_PREFIX
+            + "\n可用工具（function schema）：\n"
+            + tool_schema
+            + "\n\n"
+            + "回傳 JSON schema：\n"
+            + "{\n"
+            + '  "summary": "簡短摘要",\n'
+            + '  "done": true|false,\n'
+            + '  "related_files": ["path"],\n'
+            + '  "actions": [\n'
+            + '    {"tool": "list_files", "path": "."},\n'
+            + '    {"tool": "read_file", "path": "src/app.py"}\n'
+            + "  ]\n"
+            + "}\n"
+            + "規則：\n"
+            + f"- actions 最多只能有 {self.settings.agent_max_actions_per_iteration} 個。\n"
+            + "- `tool` 必須對應到上面的 function.name。\n"
+            + "- 其他欄位必須符合對應 function.parameters。\n"
+            + "- 若不需要任何工具，actions 請回傳空陣列。\n"
+            + "- summary 與 related_files 請反映這一輪實際結果。"
+        )
+
+    def _extract_decision_actions(self, decision: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_actions: Any = decision.get("actions")
+        if raw_actions is None:
+            raw_actions = decision.get("tool_calls")
+        if raw_actions is None and any(key in decision for key in ("tool", "name", "function")):
+            raw_actions = [decision]
+        return self._normalize_actions(raw_actions)
+
+    def _normalize_actions(self, raw_actions: Any) -> list[dict[str, Any]]:
+        if raw_actions is None:
+            return []
+        if isinstance(raw_actions, str):
+            try:
+                parsed = json.loads(raw_actions)
+            except json.JSONDecodeError:
+                try:
+                    parsed = parse_json_object(raw_actions)
+                except ValueError:
+                    return []
+            return self._normalize_actions(parsed)
+
+        if isinstance(raw_actions, dict):
+            if isinstance(raw_actions.get("tool_calls"), list):
+                candidates = raw_actions["tool_calls"]
+            elif isinstance(raw_actions.get("actions"), list):
+                candidates = raw_actions["actions"]
+            else:
+                candidates = [raw_actions]
+        elif isinstance(raw_actions, list):
+            candidates = raw_actions
+        else:
+            return []
+
+        normalized_actions: list[dict[str, Any]] = []
+        for raw_action in candidates:
+            normalized_action = self._normalize_action_call(raw_action)
+            if normalized_action is not None:
+                normalized_actions.append(normalized_action)
+        return normalized_actions
+
+    def _normalize_action_call(self, raw_action: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_action, dict):
+            return None
+
+        function = raw_action.get("function")
+        if isinstance(function, dict):
+            name = self._normalize_tool_name(function.get("name"))
+            if not name:
+                return None
+            return {"tool": name, **self._safe_parse_tool_arguments(function.get("arguments"))}
+
+        name = self._normalize_tool_name(raw_action.get("tool") or raw_action.get("name"))
+        if not name:
+            return None
+
+        normalized = {key: value for key, value in raw_action.items() if key not in {"id", "function", "name"}}
+        normalized["tool"] = name
+        if "arguments" in normalized:
+            arguments = self._safe_parse_tool_arguments(normalized.pop("arguments"))
+            normalized.update(arguments)
+        return normalized
+
+    def _safe_parse_tool_arguments(self, arguments: Any) -> dict[str, Any]:
+        if isinstance(arguments, dict):
+            return arguments
+        if arguments is None:
+            return {}
+        raw = str(arguments).strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                parsed = parse_json_object(raw)
+            except ValueError:
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _normalize_tool_name(self, tool_name: Any) -> str:
+        normalized = str(tool_name or "").strip().lower()
+        if not normalized:
+            return ""
+        return self._tool_aliases.get(normalized, normalized)
+
     async def _execute_actions(
         self,
         user_id: int,
@@ -397,76 +679,35 @@ class CodingAgent:
     ) -> tuple[list[dict[str, Any]], list[str], list[AgentTaskItem]]:
         results: list[dict[str, Any]] = []
         touched_files: list[str] = []
-        for action_index, action in enumerate(actions[: self.settings.agent_max_actions_per_iteration], start=1):
-            tool_name = action.get("tool")
+        normalized_actions = self._normalize_actions(actions)
+        for action_index, action in enumerate(normalized_actions[: self.settings.agent_max_actions_per_iteration], start=1):
+            tool_name = self._normalize_tool_name(action.get("tool"))
+            action["tool"] = tool_name
             activity_key = f"tool:{iteration}:{action_index}"
             await self._emit_activity(
                 progress_callback,
                 self._format_tool_start_message(tool_name, action),
                 activity_key=activity_key,
             )
+            spec = self._tool_specs.get(tool_name)
+            if spec is None:
+                results.append({"tool": tool_name or "(unknown)", "error": "不支援的工具。"})
+                await self._emit_activity(
+                    progress_callback,
+                    f"工具 {tool_name or '(unknown)'} 失敗：不支援的工具。",
+                    activity_key=activity_key,
+                )
+                continue
             try:
-                if tool_name == "read_file":
-                    results.append({"tool": tool_name, "path": action["path"], "result": self.workspace.read_file(user_id, action["path"])})
-                elif tool_name == "write_file":
-                    self.workspace.write_file(user_id, action["path"], action["content"])
-                    touched_files.append(action["path"])
-                    results.append({"tool": tool_name, "path": action["path"], "result": "ok"})
-                elif tool_name == "list_files":
-                    entries = self.workspace.list_files(user_id, action.get("path", "."))
-                    results.append(
-                        {
-                            "tool": tool_name,
-                            "path": action.get("path", "."),
-                            "result": [
-                                {"path": entry.path, "kind": entry.kind, "size": entry.size}
-                                for entry in entries
-                            ],
-                        }
-                    )
-                elif tool_name == "delete_file":
-                    self.workspace.delete_file(user_id, action["path"])
-                    touched_files.append(action["path"])
-                    results.append({"tool": tool_name, "path": action["path"], "result": "ok"})
-                elif tool_name == "create_folder":
-                    created_path = self.workspace.create_folder(user_id, action["path"])
-                    results.append({"tool": tool_name, "path": created_path, "result": "ok"})
-                elif tool_name == "apply_patch":
-                    changed = self.workspace.apply_patch(user_id, action["diff"])
-                    touched_files.extend(changed)
-                    results.append({"tool": tool_name, "result": changed})
-                elif tool_name == "py_compile_check":
-                    outcome = self.workspace.py_compile_check(user_id, action["path"])
-                    results.append({"tool": tool_name, "path": action["path"], "result": outcome})
-                elif tool_name == "search_web":
-                    outcome = await self._search_web(user_id, str(action["query"]))
-                    results.append({"tool": tool_name, "query": action["query"], "result": outcome})
-                elif tool_name == "fetch_url":
-                    outcome = await self._fetch_url(user_id, str(action["url"]))
-                    results.append({"tool": tool_name, "url": action["url"], "result": outcome})
-                elif tool_name == "tasks":
-                    current_task_items = self._coerce_task_items(action.get("items", []))
-                    results.append(
-                        {
-                            "tool": tool_name,
-                            "result": [
-                                {"title": item.title, "status": item.status}
-                                for item in current_task_items
-                            ],
-                        }
-                    )
-                    await self._emit_progress(
-                        progress_callback,
-                        {
-                            "type": "tasks",
-                            "items": [
-                                {"title": item.title, "status": item.status}
-                                for item in current_task_items
-                            ],
-                        },
-                    )
-                else:
-                    results.append({"tool": tool_name, "error": "不支援的工具。"})
+                result_payload, tool_touched_files, current_task_items = await self._execute_tool(
+                    spec,
+                    user_id,
+                    action,
+                    current_task_items,
+                    progress_callback,
+                )
+                touched_files.extend(tool_touched_files)
+                results.append({"tool": tool_name, **result_payload})
             except (WorkspaceError, KeyError, ValueError, aiohttp.ClientError) as exc:
                 results.append({"tool": tool_name, "error": str(exc)})
                 await self._emit_activity(
@@ -481,6 +722,201 @@ class CodingAgent:
                 activity_key=activity_key,
             )
         return results, touched_files, current_task_items
+
+    async def _execute_tool(
+        self,
+        spec: AgentToolSpec,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        handler = getattr(self, spec.handler_name)
+        return await handler(user_id, action, current_task_items, progress_callback)
+
+    async def _tool_list_files(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = str(action.get("path") or ".")
+        entries = self.workspace.list_files(user_id, path)
+        return (
+            {
+                "path": path,
+                "result": [
+                    {"path": entry.path, "kind": entry.kind, "size": entry.size}
+                    for entry in entries
+                ],
+            },
+            [],
+            current_task_items,
+        )
+
+    async def _tool_read_file(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = self._require_string_argument(action, "path")
+        return ({"path": path, "result": self.workspace.read_file(user_id, path)}, [], current_task_items)
+
+    async def _tool_write_file(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = self._require_string_argument(action, "path")
+        content = self._require_string_argument(action, "content", allow_empty=True)
+        self.workspace.write_file(user_id, path, content)
+        return ({"path": path, "result": "ok"}, [path], current_task_items)
+
+    async def _tool_apply_patch(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        diff = self._require_string_argument(action, "diff", allow_empty=True)
+        changed = self.workspace.apply_patch(user_id, diff)
+        return ({"result": changed}, changed, current_task_items)
+
+    async def _tool_delete_file(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = self._require_string_argument(action, "path")
+        self.workspace.delete_file(user_id, path)
+        return ({"path": path, "result": "ok"}, [path], current_task_items)
+
+    async def _tool_create_folder(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = self._require_string_argument(action, "path")
+        created_path = self.workspace.create_folder(user_id, path)
+        return ({"path": created_path, "result": "ok"}, [], current_task_items)
+
+    async def _tool_remove_folder(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = self._require_string_argument(action, "path")
+        force = self._coerce_bool(action.get("force"), default=False)
+        removed_path = self.workspace.remove_folder(user_id, path, force=force)
+        return ({"path": removed_path, "force": force, "result": "ok"}, [removed_path], current_task_items)
+
+    async def _tool_py_compile_check(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        path = self._require_string_argument(action, "path")
+        return ({"path": path, "result": self.workspace.py_compile_check(user_id, path)}, [], current_task_items)
+
+    async def _tool_search_web(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        query = self._require_string_argument(action, "query")
+        outcome = await self._search_web(user_id, query)
+        return ({"query": query, "result": outcome}, [], current_task_items)
+
+    async def _tool_fetch_url(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        url = self._require_string_argument(action, "url")
+        outcome = await self._fetch_url(user_id, url)
+        return ({"url": url, "result": outcome}, [], current_task_items)
+
+    async def _tool_tasks(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del user_id
+        current_task_items = self._coerce_task_items(action.get("items", []))
+        await self._emit_progress(
+            progress_callback,
+            {
+                "type": "tasks",
+                "items": [
+                    {"title": item.title, "status": item.status}
+                    for item in current_task_items
+                ],
+            },
+        )
+        return (
+            {
+                "result": [
+                    {"title": item.title, "status": item.status}
+                    for item in current_task_items
+                ],
+            },
+            [],
+            current_task_items,
+        )
+
+    def _require_string_argument(self, action: dict[str, Any], key: str, *, allow_empty: bool = False) -> str:
+        value = action.get(key)
+        if not isinstance(value, str):
+            raise ValueError(f"工具 {action.get('tool')} 缺少字串參數：{key}。")
+        if not allow_empty and not value.strip():
+            raise ValueError(f"工具 {action.get('tool')} 缺少字串參數：{key}。")
+        return value if allow_empty else value.strip()
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return default
 
     def _validate_changed_python_files(self, user_id: int, touched_files: list[str]) -> list[str]:
         validations: list[str] = []
@@ -639,15 +1075,18 @@ class CodingAgent:
             "list_files": "列出路徑",
             "delete_file": "刪除檔案",
             "create_folder": "建立資料夾",
+            "remove_folder": "刪除資料夾",
             "apply_patch": "套用 patch",
             "py_compile_check": "語法檢查",
             "search_web": "搜尋網路",
             "fetch_url": "抓取網址",
             "tasks": "更新 tasks 清單",
         }
-        return labels.get(str(tool_name), f"工具 {tool_name}")
+        normalized = self._normalize_tool_name(tool_name)
+        return labels.get(normalized, f"工具 {tool_name}")
 
     def _format_tool_start_message(self, tool_name: Any, action: dict[str, Any]) -> str:
+        tool_name = self._normalize_tool_name(tool_name)
         if tool_name == "read_file":
             return f"讀取檔案中：{action.get('path', '')}"
         if tool_name == "write_file":
@@ -658,6 +1097,8 @@ class CodingAgent:
             return f"刪除檔案中：{action.get('path', '')}"
         if tool_name == "create_folder":
             return f"建立資料夾中：{action.get('path', '')}"
+        if tool_name == "remove_folder":
+            return f"刪除資料夾中：{action.get('path', '')}"
         if tool_name == "apply_patch":
             return "套用 patch 中。"
         if tool_name == "py_compile_check":
@@ -671,7 +1112,8 @@ class CodingAgent:
         return f"執行工具中：{tool_name}"
 
     def _format_tool_finish_message(self, tool_name: Any, action: dict[str, Any]) -> str:
-        if tool_name in {"read_file", "write_file", "delete_file", "create_folder", "py_compile_check"}:
+        tool_name = self._normalize_tool_name(tool_name)
+        if tool_name in {"read_file", "write_file", "delete_file", "create_folder", "remove_folder", "py_compile_check"}:
             return f"{self._format_tool_label(tool_name)}已完成：{action.get('path', '')}"
         if tool_name == "list_files":
             return f"列出路徑已完成：{action.get('path', '.') }"
@@ -748,33 +1190,15 @@ _COMPRESSION_SYSTEM_PROMPT = """
 """
 
 
-_AGENT_SYSTEM_PROMPT = """
+_AGENT_SYSTEM_PROMPT_PREFIX = """
 你是運行在受限文字檔工作區中的 AI 程式代理。
 重要規則：
 - 使用者不能執行程式碼。
-- 只能使用這些工具：read_file, write_file, list_files, delete_file, create_folder, apply_patch, py_compile_check, search_web, fetch_url, tasks。
+- 只可使用下方列出的 tools。
 - 編輯既有檔案時優先使用 apply_patch。
 - 只可寫入 UTF-8 文字檔。
 - 只回傳合法 JSON。
-- summary 與 plan 內容請使用繁體中文。
+- summary 與 related_files 內容請使用繁體中文。
 - fetch_url 可直接抓取公開網址內容；若設定了 PROXY_* 環境變數，會透過 proxy 抓取，不需要先經過 search_web。
 - 如果目前工作有明確步驟，請使用 tasks 工具更新工作清單，好讓使用者看到目前進度。
-- JSON schema:
-  {
-        "summary": "簡短摘要",
-    "done": true|false,
-    "related_files": ["path"],
-    "actions": [
-      {"tool":"list_files","path":"."},
-      {"tool":"read_file","path":"src/app.py"},
-      {"tool":"write_file","path":"README.md","content":"..."},
-      {"tool":"apply_patch","diff":"--- a/file.py\\n+++ b/file.py\\n@@ ..."},
-      {"tool":"create_folder","path":"src"},
-      {"tool":"delete_file","path":"old.py"},
-      {"tool":"py_compile_check","path":"app.py"},
-      {"tool":"search_web","query":"..."},
-            {"tool":"fetch_url","url":"https://..."},
-            {"tool":"tasks","items":[{"title":"檢查需求","status":"in_progress"},{"title":"更新 bot.py","status":"pending"}]}
-    ]
-  }
 """
