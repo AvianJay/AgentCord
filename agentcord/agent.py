@@ -25,6 +25,7 @@ from agentcord.pterodactyl import (
     update_pterodactyl_startup_variable,
     write_pterodactyl_server_file,
 )
+from agentcord.proxy import build_proxy_request_kwargs, open_proxy_aware_session
 from agentcord.workspace import WorkspaceError, WorkspaceManager
 
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[Any] | Any | None]
@@ -1947,28 +1948,20 @@ class CodingAgent:
         return data
 
     async def _fetch_url(self, user_id: int, url: str) -> str:
-        request_kwargs = self._build_proxy_request_kwargs()
-        async with self.session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=45),
-            allow_redirects=True,
-            **request_kwargs,
-        ) as response:
-            response.raise_for_status()
-            return await response.text()
+        del user_id
+        request_kwargs = build_proxy_request_kwargs(self.settings)
+        async with open_proxy_aware_session(self.session, self.settings) as request_session:
+            async with request_session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=45),
+                allow_redirects=True,
+                **request_kwargs,
+            ) as response:
+                response.raise_for_status()
+                return await response.text()
 
     def _build_proxy_request_kwargs(self) -> dict[str, Any]:
-        if not self.settings.proxy_url:
-            return {}
-        request_kwargs: dict[str, Any] = {"proxy": self.settings.proxy_url}
-        if self.settings.proxy_username:
-            request_kwargs["proxy_auth"] = aiohttp.BasicAuth(
-                self.settings.proxy_username,
-                self.settings.proxy_password,
-            )
-        if self.settings.proxy_headers:
-            request_kwargs["proxy_headers"] = self.settings.proxy_headers
-        return request_kwargs
+        return build_proxy_request_kwargs(self.settings)
 
 
 _PLANNING_SYSTEM_PROMPT = """

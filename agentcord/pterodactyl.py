@@ -11,6 +11,7 @@ import aiohttp
 
 from agentcord.config import Settings
 from agentcord.models import UserPterodactylConfig
+from agentcord.proxy import ProxyConfigurationError, build_proxy_request_kwargs, open_proxy_aware_session
 
 _CLIENT_ACCEPT_HEADER = "Application/vnd.pterodactyl.v1+json"
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
@@ -28,19 +29,10 @@ class PterodactylResponse:
 
 
 def build_required_proxy_request_kwargs(settings: Settings) -> dict[str, Any]:
-    if not settings.proxy_url:
-        raise PterodactylError(
-            "Pterodactyl 僅允許透過 proxy 請求；請先設定 PROXY_URL，或提供 PROXY_HOST/PROXY_PORT。"
-        )
-    request_kwargs: dict[str, Any] = {"proxy": settings.proxy_url}
-    if settings.proxy_username:
-        request_kwargs["proxy_auth"] = aiohttp.BasicAuth(
-            settings.proxy_username,
-            settings.proxy_password,
-        )
-    if settings.proxy_headers:
-        request_kwargs["proxy_headers"] = settings.proxy_headers
-    return request_kwargs
+    try:
+        return build_proxy_request_kwargs(settings, require_proxy=True)
+    except ProxyConfigurationError as exc:
+        raise PterodactylError(str(exc)) from exc
 
 
 def normalize_pterodactyl_base_url(base_url: str) -> str:
@@ -227,91 +219,98 @@ async def request_pterodactyl_client_api(
     params = {str(key): value for key, value in (query or {}).items()}
 
     try:
-        async with session.request(
-            normalized_method,
-            url,
-            params=params,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=45),
-            **proxy_request_kwargs,
-            **request_kwargs,
-        ) as response:
-            response_text = await response.text()
-            if response.status >= 400:
-                raise PterodactylError(_format_pterodactyl_error(response.status, response_text))
-            return PterodactylResponse(
-                status=response.status,
-                data=_decode_response_data(response, response_text, normalized_expect),
-                text=response_text,
-            )
+        async with open_proxy_aware_session(session, settings, require_proxy=True) as request_session:
+            async with request_session.request(
+                normalized_method,
+                url,
+                params=params,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=45),
+                **proxy_request_kwargs,
+                **request_kwargs,
+            ) as response:
+                response_text = await response.text()
+                if response.status >= 400:
+                    raise PterodactylError(_format_pterodactyl_error(response.status, response_text))
+                return PterodactylResponse(
+                    status=response.status,
+                    data=_decode_response_data(response, response_text, normalized_expect),
+                    text=response_text,
+                )
+    except ProxyConfigurationError as exc:
+        raise PterodactylError(str(exc)) from exc
     except PterodactylError:
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         raise PterodactylError(_format_pterodactyl_network_error(exc, settings, url)) from exc
 
 
-async def fetch_pterodactyl_account(
-    session: aiohttp.ClientSession,
-    settings: Settings,
-    base_url: str,
-    api_key: str,
-) -> tuple[UserPterodactylConfig, dict[str, Any]]:
-    normalized_config = UserPterodactylConfig(
-        base_url=normalize_pterodactyl_base_url(base_url),
-        api_key=api_key.strip(),
-    )
-    response = await request_pterodactyl_client_api(
-        session,
-        settings,
-        normalized_config,
-        "GET",
-        "/account",
-        expect="json",
-    )
-    if not isinstance(response.data, dict):
-        raise PterodactylError("Pterodactyl 帳號驗證回應格式無效。")
-    return normalized_config, response.data
+    try:
+        async with open_proxy_aware_session(session, settings, require_proxy=True) as request_session:
+            async with request_session.ws_connect(
+                socket_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Origin": origin,
+                },
+                heartbeat=20,
+                timeout=aiohttp.ClientTimeout(total=max(10, wait_seconds + 5)),
+                **proxy_request_kwargs,
+            ) as websocket:
+                await websocket.send_json({"event": "auth", "args": [token]})
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        message = await asyncio.wait_for(websocket.receive(), timeout=min(remaining, 2.0))
+                    except asyncio.TimeoutError:
+                        continue
 
+                    if message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
+                        break
+                    if message.type is aiohttp.WSMsgType.ERROR:
+                        raise PterodactylError(f"Pterodactyl websocket 錯誤：{websocket.exception()}")
+                    if message.type is not aiohttp.WSMsgType.TEXT:
+                        continue
 
-async def get_pterodactyl_startup(
-    session: aiohttp.ClientSession,
-    settings: Settings,
-    config: UserPterodactylConfig,
-    server: str,
-) -> dict[str, Any]:
-    response = await request_pterodactyl_client_api(
-        session,
-        settings,
-        config,
-        "GET",
-        f"/servers/{server}/startup",
-        expect="json",
-    )
-    if not isinstance(response.data, dict):
-        raise PterodactylError("Pterodactyl startup 回應格式無效。")
-    return response.data
+                    try:
+                        payload = json.loads(message.data)
+                    except json.JSONDecodeError:
+                        daemon_messages.append(str(message.data))
+                        daemon_messages[:] = daemon_messages[-20:]
+                        continue
 
-
-async def update_pterodactyl_startup_variable(
-    session: aiohttp.ClientSession,
-    settings: Settings,
-    config: UserPterodactylConfig,
-    server: str,
-    key: str,
-    value: str,
-) -> dict[str, Any]:
-    response = await request_pterodactyl_client_api(
-        session,
-        settings,
-        config,
-        "PUT",
-        f"/servers/{server}/startup/variable",
-        body={"key": key, "value": value},
-        expect="json",
-    )
-    if not isinstance(response.data, dict):
-        raise PterodactylError("Pterodactyl startup variable 回應格式無效。")
-    return response.data
+                    event = str(payload.get("event") or "").strip().lower()
+                    args = payload.get("args") if isinstance(payload.get("args"), list) else []
+                    if event == "console output" and args:
+                        raw_output = str(args[0])
+                        lines = raw_output.splitlines() or [raw_output]
+                        for line in lines:
+                            normalized_line = line.rstrip("\r")
+                            if normalized_line:
+                                console_lines.append(normalized_line)
+                        console_lines[:] = console_lines[-max_lines:]
+                        continue
+                    if event == "status" and args:
+                        statuses.append(str(args[0]))
+                        statuses[:] = statuses[-20:]
+                        continue
+                    if event == "stats" and args:
+                        stat_payload = args[0]
+                        stats.append(stat_payload if isinstance(stat_payload, dict) else str(stat_payload))
+                        stats[:] = stats[-5:]
+                        continue
+                    if event == "daemon message" and args:
+                        daemon_messages.append(str(args[0]))
+                        daemon_messages[:] = daemon_messages[-20:]
+                        continue
+                    if event == "jwt error" and args:
+                        jwt_errors.append(str(args[0]))
+                        jwt_errors[:] = jwt_errors[-5:]
+                        continue
+    except ProxyConfigurationError as exc:
+        raise PterodactylError(str(exc)) from exc
 
 
 async def set_pterodactyl_power_state(

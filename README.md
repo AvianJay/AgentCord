@@ -40,8 +40,8 @@ Environment variables:
 - `DISCORD_LOG_WEBHOOK` (optional, sends batched webhook embeds for command and agent activity logs)
 - `POLLINATIONS_API_KEY` (optional, used for Pollinations and search)
 - `AGENTCORD_CUSTOM_PROVIDER_BASE_URL` (required when provider is `custom`)
-- `PROXY_URL` (optional, used by agent `fetch_url` for proxied webpage fetching)
-- `PROXY_USERNAME` / `PROXY_PASSWORD` (optional, proxy credentials for `fetch_url`)
+- `PROXY_URL` (optional, used by agent `fetch_url` and Pterodactyl requests; supports `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://`, `socks5h://`)
+- `PROXY_USERNAME` / `PROXY_PASSWORD` (optional, proxy credentials for supported proxy types)
 - `PROXY_HOST` / `PROXY_PORT` / `PROXY_SCHEME` (optional fallback to build `PROXY_URL`)
 - `PROXY_HEADERS_JSON` (optional JSON object for proxy request headers)
 - `AGENTCORD_DATA_DIR` (defaults to `./data`)
@@ -62,4 +62,5 @@ python main.py
 - `/import-zip` only accepts valid zip archives containing UTF-8 text files and rejects path traversal entries.
 - When `DISCORD_LOG_WEBHOOK` is set, command usage, agent session actions, and execution errors are queued and sent to the webhook in embed batches.
 - `/set-pterodactyl` validates the provided panel URL and Client API key against `GET /api/client/account` before saving them for the current user.
+- SOCKS proxies require the installed `aiohttp-socks` dependency; the packaged dependencies include it by default.
 - Agent workspace tree and Pterodactyl sync automatically ignore bulky generated directories such as `.venv`, `venv`, `node_modules`, and `__pycache__`, while still showing those directories at the tree level so the model can decide whether to add more ignore rules.
