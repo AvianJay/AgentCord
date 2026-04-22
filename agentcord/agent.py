@@ -478,11 +478,21 @@ class CodingAgent:
             ),
             AgentToolSpec(
                 name="apply_patch",
-                description="以 unified diff / patch 形式修改既有檔案。",
+                description=(
+                    "以 git/unified diff 修改既有檔案。"
+                    "每個檔案區段都必須包含 --- 與 +++ 路徑列，以及 @@ hunk header。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "diff": {"type": "string", "description": "要套用的 unified diff。"},
+                        "diff": {
+                            "type": "string",
+                            "description": (
+                                "要套用的 git/unified diff。"
+                                "必須使用工作區相對路徑，且每個檔案區段都要包含 ---、+++、@@。"
+                                "不要使用 *** Begin Patch / *** Update File 這類自訂格式。"
+                            ),
+                        },
                     },
                     "required": ["diff"],
                 },
@@ -2162,7 +2172,27 @@ _COMPRESSION_SYSTEM_PROMPT = """
 """
 
 
-_AGENT_SYSTEM_PROMPT_PREFIX = """
+_APPLY_PATCH_FORMAT_GUIDANCE = """
+apply_patch 的 diff 必須符合下列格式：
+- 使用 git/unified diff。
+- 每個檔案區段都必須包含 --- 舊路徑、+++ 新路徑、以及 @@ hunk header。
+- 路徑必須是工作區相對路徑；可以有 a/ 與 b/ 前綴。
+- 不要輸出 *** Begin Patch、*** Update File、JSON patch、或只有 +/- 內容但沒有檔案 header/hunk header 的片段。
+- 若 apply_patch 因格式錯誤或上下文不符而失敗，先重新 read_file，再送出修正後的 unified diff；若檔案很小，也可改用 write_file 寫入完整內容。
+
+合法範例：
+--- src/controllers/posts.ts
++++ src/controllers/posts.ts
+@@ -10,7 +10,7 @@
+ old line
+-return res.status(500).json({ error: "failed" });
++return res.redirect("/posts");
+ next line
+"""
+
+
+_AGENT_SYSTEM_PROMPT_PREFIX = (
+    """
 你是運行在受限文字檔工作區中的 AI 程式代理。
 重要規則：
 - 使用者不能執行程式碼。
@@ -2178,4 +2208,8 @@ _AGENT_SYSTEM_PROMPT_PREFIX = """
 - pterodactyl_sync_workspace 可將工作區推到伺服器，也可從伺服器拉回工作區；兩個方向都會套用 ignore_patterns，且在列舉與同步階段都會自動忽略 .npm、.venv、venv、node_modules、__pycache__ 等大型或衍生目錄。
 - pterodactyl_read_console 只能擷取建立連線後的 live 輸出；若要觀察啟動過程，請在 power_action 後立刻呼叫，必要時再搭配 sleep。
 - 如果目前工作有明確步驟，請使用 tasks 工具更新工作清單，好讓使用者看到目前進度。
+
+apply_patch 格式要求：
 """
+    + _APPLY_PATCH_FORMAT_GUIDANCE
+)
