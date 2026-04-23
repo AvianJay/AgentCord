@@ -174,6 +174,22 @@ def register_commands(bot: AgentCordBot) -> None:
             return normalized
         return normalized[: limit - 3] + "..."
 
+    def format_usage_summary(config: UserModelConfig, usage: object, remaining: float) -> list[str]:
+        usage_cost = getattr(usage, "cost", 0.0)
+        input_tokens = getattr(usage, "input_tokens", 0)
+        output_tokens = getattr(usage, "output_tokens", 0)
+        model_rate = getattr(usage, "model_rate", 0.0)
+        charged_amount = bot.credits.billed_amount(config, usage_cost)
+        if bot.credits.should_charge(config):
+            return [
+                f"已使用額度：{charged_amount:.2f} (輸入={input_tokens}，輸出={output_tokens}，單價={model_rate:.3f})",
+                f"剩餘額度：{remaining:.2f}",
+            ]
+        return [
+            f"本次使用自訂模型，不扣額度。 (輸入={input_tokens}，輸出={output_tokens}，單價={model_rate:.3f})",
+            f"目前額度：{remaining:.2f}",
+        ]
+
     async def log_interaction(
         interaction: discord.Interaction,
         description: str,
@@ -284,21 +300,18 @@ def register_commands(bot: AgentCordBot) -> None:
         bot.credits.ensure_affordable(interaction.user.id, config, prompt)
         await interaction.response.defer(ephemeral=True, thinking=True)
         response = await provider.generate(messages)
-        remaining = bot.credits.charge(interaction.user.id, response.usage.cost)
+        remaining = bot.credits.charge(interaction.user.id, config, response.usage.cost)
+        charged_amount = bot.credits.billed_amount(config, response.usage.cost)
         await log_interaction(
             interaction,
             f"使用 /ask 提問。\nPrompt: {preview_text(prompt)}",
             fields=[
                 ("模型", f"{config.provider.value}/{config.model}", True),
-                ("花費", f"{response.usage.cost:.2f}", True),
+                ("花費", f"{charged_amount:.2f}", True),
             ],
         )
-        reply = (
-            f"{response.content}\n\n"
-            f"已使用額度：{response.usage.cost:.2f} "
-            f"(輸入={response.usage.input_tokens}，輸出={response.usage.output_tokens}，單價={response.usage.model_rate:.3f})\n"
-            f"剩餘額度：{remaining:.2f}"
-        )
+        usage_lines = format_usage_summary(config, response.usage, remaining)
+        reply = f"{response.content}\n\n" + "\n".join(usage_lines)
         for index, chunk in enumerate(chunk_text(reply)):
             if index == 0:
                 await interaction.followup.send(chunk, ephemeral=True)
@@ -321,6 +334,7 @@ def register_commands(bot: AgentCordBot) -> None:
     @app_commands.describe(prompt="描述要讓 AI 規劃的程式任務。")
     async def plan_command(interaction: discord.Interaction, prompt: str) -> None:
         assert bot.agent is not None
+        config = bot.db.get_model_config(interaction.user.id, bot.settings.default_pollinations_model)
         await interaction.response.defer(thinking=True)
         result = await bot.agent.plan(interaction.user.id, prompt)
         usage = result.usage
@@ -341,8 +355,7 @@ def register_commands(bot: AgentCordBot) -> None:
                 [
                     "",
                     f"模型：{result.model or '(未設定)'}",
-                    f"已使用額度：{usage.cost:.2f} (輸入={usage.input_tokens}，輸出={usage.output_tokens}，單價={usage.model_rate:.3f})",
-                    f"剩餘額度：{remaining:.2f}",
+                    *format_usage_summary(config, usage, remaining),
                 ]
             )
         message = "\n".join(lines)

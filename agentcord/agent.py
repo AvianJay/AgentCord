@@ -88,7 +88,15 @@ class CreditManager:
         self.db = db
         self.settings = settings
 
+    def should_charge(self, config: UserModelConfig) -> bool:
+        return config.provider is Provider.POLLINATIONS
+
+    def billed_amount(self, config: UserModelConfig, amount: float) -> float:
+        return amount if self.should_charge(config) else 0.0
+
     def ensure_affordable(self, user_id: int, config: UserModelConfig, input_text: str) -> None:
+        if not self.should_charge(config):
+            return
         estimated_input_tokens = max(1, len(input_text) // 4)
         reserve = self.settings.credit_reserve_output_tokens
         rate = self.settings.get_model_rate(config.provider, config.model)
@@ -99,7 +107,9 @@ class CreditManager:
                 f"目前可用 {self.db.get_credits(user_id):.2f}。"
             )
 
-    def charge(self, user_id: int, amount: float) -> float:
+    def charge(self, user_id: int, config: UserModelConfig, amount: float) -> float:
+        if not self.should_charge(config):
+            return self.db.get_credits(user_id)
         return self.db.consume_credits(user_id, amount)
 
 
@@ -222,7 +232,7 @@ class CodingAgent:
                         activity_key=f"decision:{iteration}",
                     ),
                 )
-                self.credits.charge(user_id, step_response.usage.cost)
+                self.credits.charge(user_id, config, step_response.usage.cost)
                 actual_model = step_response.model or actual_model
                 await self._emit_progress(
                     progress_callback,
@@ -398,7 +408,7 @@ class CodingAgent:
                 activity_key="plan",
             ),
         )
-        self.credits.charge(user_id, response.usage.cost)
+        self.credits.charge(user_id, config, response.usage.cost)
         resolved_model = response.model or current_model
         await self._emit_progress(
             progress_callback,
@@ -1984,7 +1994,7 @@ class CodingAgent:
                     {"role": "user", "content": summary_prompt},
                 ]
             )
-            self.credits.charge(user_id, response.usage.cost)
+            self.credits.charge(user_id, config, response.usage.cost)
             history_messages = [
                 ConversationMessage(role="system", content=f"較早對話摘要：{response.content.strip()}"),
                 *recent_messages,
