@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from abc import ABC, abstractmethod
+from urllib.parse import urlsplit
 from typing import Any, Awaitable, Callable
 
 import aiohttp
 
 from agentcord.config import Settings
 from agentcord.models import AIResponse, AIUsage, PollinationsModelInfo, Provider, ProviderModelInfo, UserModelConfig, estimate_tokens
+from agentcord.proxy import build_proxy_request_kwargs, open_proxy_aware_session
 
 _POLLINATIONS_MODELS_CACHE_TTL = 900.0
 _pollinations_models_cache: tuple[float, list[PollinationsModelInfo], dict[str, PollinationsModelInfo]] | None = None
@@ -18,6 +21,11 @@ _provider_models_cache: dict[
     tuple[str, str, str],
     tuple[float, list[ProviderModelInfo], dict[str, ProviderModelInfo]],
 ] = {}
+_OPENAI_COMPATIBLE_PROVIDERS = {Provider.OPENAI, Provider.XAI, Provider.POE, Provider.CUSTOM}
+_THINKING_TAG_RE = re.compile(r"<(?P<tag>think|thinking)>[\s\S]*?</(?P=tag)>", re.IGNORECASE)
+_THINKING_FENCE_RE = re.compile(r"```(?:think|thinking|reasoning|thoughts?)\s*[\s\S]*?```", re.IGNORECASE)
+_THINKING_LABEL_RE = re.compile(r"^\s*(?:thinking|reasoning|thought\s*process)\s*(?::|：|\.\.\.)", re.IGNORECASE)
+_THINKING_LINE_RE = re.compile(r"^\s*(?:thinking|reasoning|thought\s*process)\s*(?::|：|\.\.\.)?\s*$", re.IGNORECASE)
 
 
 def _resolve_response_model(payload: Any) -> str | None:
@@ -28,6 +36,28 @@ def _resolve_response_model(payload: Any) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def sanitize_ai_response_content(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    cleaned = _THINKING_TAG_RE.sub("", cleaned)
+    cleaned = _THINKING_FENCE_RE.sub("", cleaned)
+
+    lines = cleaned.splitlines()
+    while lines and (not lines[0].strip() or _THINKING_LINE_RE.match(lines[0])):
+        lines.pop(0)
+    cleaned = "\n".join(lines).strip()
+    if not cleaned:
+        return text.strip()
+
+    paragraphs = re.split(r"\n\s*\n", cleaned, maxsplit=1)
+    if len(paragraphs) == 2 and _THINKING_LABEL_RE.match(paragraphs[0].strip()):
+        cleaned = paragraphs[1].strip()
+
+    return cleaned or text.strip()
 
 
 def _request_timeout() -> aiohttp.ClientTimeout:
@@ -118,6 +148,53 @@ def _extract_description(payload: dict[str, Any], *keys: str) -> str:
 
 def _provider_cache_key(provider: Provider, api_key: str, *, base_url: str = "") -> tuple[str, str, str]:
     return (provider.value, _cache_secret(api_key.strip()), base_url.rstrip("/"))
+
+
+def _parse_custom_provider_api_key(value: str) -> tuple[str, str] | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    for index in range(len(raw) - 1, -1, -1):
+        if raw[index] != ":":
+            continue
+        base_url = raw[:index].strip().rstrip("/")
+        api_key = raw[index + 1 :].strip()
+        if not base_url or not api_key:
+            continue
+        parsed = urlsplit(base_url)
+        if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            return base_url, api_key
+    return None
+
+
+def _resolve_custom_provider_credentials(settings: Settings, value: str) -> tuple[str, str]:
+    parsed = _parse_custom_provider_api_key(value)
+    if parsed is not None:
+        return parsed
+    legacy_base_url = settings.custom_provider_base_url.strip().rstrip("/")
+    if legacy_base_url and value.strip():
+        return legacy_base_url, value.strip()
+    raise ValueError(
+        "自訂供應商的 api_key 請填 {apiurl}:{apikey}，例如 https://api.example.com/v1:sk-xxx。"
+    )
+
+
+def _resolve_openai_compatible_endpoint(
+    settings: Settings,
+    provider: Provider,
+    api_key: str,
+) -> tuple[str, str, bool]:
+    raw_api_key = api_key.strip()
+    if provider is Provider.OPENAI:
+        return "https://api.openai.com/v1", raw_api_key, False
+    if provider is Provider.XAI:
+        return "https://api.x.ai/v1", raw_api_key, False
+    if provider is Provider.POE:
+        return "https://api.poe.com/v1", raw_api_key, False
+    if provider is Provider.CUSTOM:
+        base_url, resolved_api_key = _resolve_custom_provider_credentials(settings, raw_api_key)
+        return base_url, resolved_api_key, True
+    raise ValueError(f"不支援的供應商：{provider}")
 
 
 def _cache_provider_models(
@@ -268,20 +345,26 @@ def _parse_google_models(payload: Any) -> list[ProviderModelInfo]:
 
 async def _fetch_openai_compatible_models(
     session: aiohttp.ClientSession,
+    settings: Settings,
     provider: Provider,
     api_key: str,
     base_url: str,
+    *,
+    require_proxy: bool = False,
 ) -> list[ProviderModelInfo]:
-    async with session.get(
-        f"{base_url.rstrip('/')}/models",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=_model_list_timeout(),
-    ) as response:
-        response.raise_for_status()
-        payload = await response.json()
+    request_kwargs = build_proxy_request_kwargs(settings, require_proxy=require_proxy) if require_proxy else {}
+    async with open_proxy_aware_session(session, settings, require_proxy=require_proxy) as request_session:
+        async with request_session.get(
+            f"{base_url.rstrip('/')}/models",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=_model_list_timeout(),
+            **request_kwargs,
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
     return _parse_openai_compatible_models(payload, provider)
 
 
@@ -352,16 +435,10 @@ async def fetch_provider_models(
         return []
 
     base_url = ""
-    if provider is Provider.OPENAI:
-        base_url = "https://api.openai.com/v1"
-    elif provider is Provider.XAI:
-        base_url = "https://api.x.ai/v1"
-    elif provider is Provider.POE:
-        base_url = "https://api.poe.com/v1"
-    elif provider is Provider.CUSTOM:
-        base_url = settings.custom_provider_base_url.strip()
-        if not base_url:
-            raise ValueError("自訂供應商必須設定 AGENTCORD_CUSTOM_PROVIDER_BASE_URL。")
+    resolved_api_key = api_key
+    require_proxy = False
+    if provider in _OPENAI_COMPATIBLE_PROVIDERS:
+        base_url, resolved_api_key, require_proxy = _resolve_openai_compatible_endpoint(settings, provider, api_key)
 
     if not force_refresh:
         cached = _get_cached_provider_models(provider, api_key, base_url=base_url)
@@ -369,8 +446,15 @@ async def fetch_provider_models(
             models, _ = cached
             return models
 
-    if provider in {Provider.OPENAI, Provider.XAI, Provider.POE, Provider.CUSTOM}:
-        models = await _fetch_openai_compatible_models(session, provider, api_key, base_url)
+    if provider in _OPENAI_COMPATIBLE_PROVIDERS:
+        models = await _fetch_openai_compatible_models(
+            session,
+            settings,
+            provider,
+            resolved_api_key,
+            base_url,
+            require_proxy=require_proxy,
+        )
     elif provider is Provider.ANTHROPIC:
         models = await _fetch_anthropic_models(session, api_key)
     elif provider is Provider.GOOGLE:
@@ -404,16 +488,8 @@ async def resolve_provider_model(
         return None
 
     base_url = ""
-    if provider is Provider.OPENAI:
-        base_url = "https://api.openai.com/v1"
-    elif provider is Provider.XAI:
-        base_url = "https://api.x.ai/v1"
-    elif provider is Provider.POE:
-        base_url = "https://api.poe.com/v1"
-    elif provider is Provider.CUSTOM:
-        base_url = settings.custom_provider_base_url.strip()
-        if not base_url:
-            raise ValueError("自訂供應商必須設定 AGENTCORD_CUSTOM_PROVIDER_BASE_URL。")
+    if provider in _OPENAI_COMPATIBLE_PROVIDERS:
+        base_url, _, _ = _resolve_openai_compatible_endpoint(settings, provider, api_key)
 
     models = await fetch_provider_models(session, settings, provider, api_key)
     cached = _get_cached_provider_models(provider, api_key, base_url=base_url)
@@ -497,7 +573,7 @@ class PollinationsProvider(AIProvider):
         ) as response:
             response.raise_for_status()
             data = await response.json()
-        content = data["choices"][0]["message"]["content"]
+        content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
         return AIResponse(
             content=content,
             usage=self._build_usage(messages, content),
@@ -529,7 +605,7 @@ class PollinationsProvider(AIProvider):
             response.raise_for_status()
             if response.content_type == "application/json":
                 data = await response.json()
-                content = data["choices"][0]["message"]["content"]
+                content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
                 if on_delta and content:
                     maybe_result = on_delta(content)
                     if maybe_result is not None:
@@ -564,7 +640,7 @@ class PollinationsProvider(AIProvider):
                     if maybe_result is not None:
                         await maybe_result
 
-        content = "".join(content_parts)
+        content = sanitize_ai_response_content("".join(content_parts))
         resolved_model = response_model or self.config.model
         return AIResponse(
             content=content,
@@ -581,13 +657,23 @@ class OpenAICompatibleProvider(AIProvider):
         settings: Settings,
         config: UserModelConfig,
         base_url: str,
+        *,
+        api_key: str | None = None,
+        require_proxy: bool = False,
     ) -> None:
         super().__init__(session, settings, config)
         self.base_url = base_url.rstrip("/")
+        self.request_api_key = (api_key if api_key is not None else config.api_key).strip()
+        self.require_proxy = require_proxy
+
+    def _proxy_request_kwargs(self) -> dict[str, Any]:
+        if not self.require_proxy:
+            return {}
+        return build_proxy_request_kwargs(self.settings, require_proxy=True)
 
     async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> AIResponse:
         headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
+            "Authorization": f"Bearer {self.request_api_key}",
             "Content-Type": "application/json",
         }
         payload = {
@@ -595,15 +681,17 @@ class OpenAICompatibleProvider(AIProvider):
             "messages": messages,
             "temperature": kwargs.get("temperature", 0.2),
         }
-        async with self.session.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=_request_timeout(),
-        ) as response:
-            response.raise_for_status()
-            data = await response.json()
-        content = data["choices"][0]["message"]["content"]
+        async with open_proxy_aware_session(self.session, self.settings, require_proxy=self.require_proxy) as request_session:
+            async with request_session.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=_request_timeout(),
+                **self._proxy_request_kwargs(),
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+        content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
         return AIResponse(
             content=content,
             usage=self._build_usage(messages, content),
@@ -618,7 +706,7 @@ class OpenAICompatibleProvider(AIProvider):
         **kwargs: Any,
     ) -> AIResponse:
         headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
+            "Authorization": f"Bearer {self.request_api_key}",
             "Content-Type": "application/json",
         }
         payload = {
@@ -627,51 +715,53 @@ class OpenAICompatibleProvider(AIProvider):
             "temperature": kwargs.get("temperature", 0.2),
             "stream": True,
         }
-        async with self.session.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=_stream_timeout(),
-        ) as response:
-            response.raise_for_status()
-            if response.content_type == "application/json":
-                data = await response.json()
-                content = data["choices"][0]["message"]["content"]
-                if on_delta and content:
-                    maybe_result = on_delta(content)
-                    if maybe_result is not None:
-                        await maybe_result
-                return AIResponse(
-                    content=content,
-                    usage=self._build_usage(messages, content),
-                    model=_resolve_response_model(data) or self.config.model,
-                    raw_response=data,
-                )
+        async with open_proxy_aware_session(self.session, self.settings, require_proxy=self.require_proxy) as request_session:
+            async with request_session.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=_stream_timeout(),
+                **self._proxy_request_kwargs(),
+            ) as response:
+                response.raise_for_status()
+                if response.content_type == "application/json":
+                    data = await response.json()
+                    content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
+                    if on_delta and content:
+                        maybe_result = on_delta(content)
+                        if maybe_result is not None:
+                            await maybe_result
+                    return AIResponse(
+                        content=content,
+                        usage=self._build_usage(messages, content),
+                        model=_resolve_response_model(data) or self.config.model,
+                        raw_response=data,
+                    )
 
-            content_parts: list[str] = []
-            response_model = ""
-            async for raw_line in response.content:
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload_line = line[5:].strip()
-                if payload_line == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(payload_line)
-                except json.JSONDecodeError:
-                    continue
-                response_model = _resolve_response_model(chunk) or response_model
-                delta = _extract_stream_text(chunk)
-                if not delta:
-                    continue
-                content_parts.append(delta)
-                if on_delta:
-                    maybe_result = on_delta(delta)
-                    if maybe_result is not None:
-                        await maybe_result
+                content_parts: list[str] = []
+                response_model = ""
+                async for raw_line in response.content:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload_line = line[5:].strip()
+                    if payload_line == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload_line)
+                    except json.JSONDecodeError:
+                        continue
+                    response_model = _resolve_response_model(chunk) or response_model
+                    delta = _extract_stream_text(chunk)
+                    if not delta:
+                        continue
+                    content_parts.append(delta)
+                    if on_delta:
+                        maybe_result = on_delta(delta)
+                        if maybe_result is not None:
+                            await maybe_result
 
-        content = "".join(content_parts)
+        content = sanitize_ai_response_content("".join(content_parts))
         resolved_model = response_model or self.config.model
         return AIResponse(
             content=content,
@@ -707,7 +797,9 @@ class AnthropicProvider(AIProvider):
         ) as response:
             response.raise_for_status()
             data = await response.json()
-        content = "".join(block["text"] for block in data.get("content", []) if block.get("type") == "text")
+        content = sanitize_ai_response_content(
+            "".join(block["text"] for block in data.get("content", []) if block.get("type") == "text")
+        )
         return AIResponse(
             content=content,
             usage=self._build_usage(messages, content),
@@ -729,7 +821,7 @@ class GoogleProvider(AIProvider):
         ) as response:
             response.raise_for_status()
             data = await response.json()
-        content = data["candidates"][0]["content"]["parts"][0]["text"]
+        content = sanitize_ai_response_content(data["candidates"][0]["content"]["parts"][0]["text"])
         return AIResponse(
             content=content,
             usage=self._build_usage(messages, content),
@@ -752,9 +844,15 @@ def create_provider(
     if config.provider is Provider.POE:
         return OpenAICompatibleProvider(session, settings, config, "https://api.poe.com/v1")
     if config.provider is Provider.CUSTOM:
-        if not settings.custom_provider_base_url:
-            raise ValueError("自訂供應商必須設定 AGENTCORD_CUSTOM_PROVIDER_BASE_URL。")
-        return OpenAICompatibleProvider(session, settings, config, settings.custom_provider_base_url)
+        base_url, resolved_api_key = _resolve_custom_provider_credentials(settings, config.api_key)
+        return OpenAICompatibleProvider(
+            session,
+            settings,
+            config,
+            base_url,
+            api_key=resolved_api_key,
+            require_proxy=True,
+        )
     if config.provider is Provider.ANTHROPIC:
         return AnthropicProvider(session, settings, config)
     if config.provider is Provider.GOOGLE:
@@ -763,7 +861,7 @@ def create_provider(
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
-    cleaned = text.strip()
+    cleaned = sanitize_ai_response_content(text)
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()
         if lines and lines[0].startswith("```"):

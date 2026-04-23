@@ -476,6 +476,22 @@ class CodingAgent:
                 handler_name="_tool_read_file",
             ),
             AgentToolSpec(
+                name="grep_search",
+                description="在工作區 UTF-8 文字檔中搜尋文字或 regex，回傳符合的檔案、行號與內容片段。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "要搜尋的文字或 regex。"},
+                        "path": {"type": "string", "description": "搜尋起點；可填資料夾或單一檔案，預設為 .。"},
+                        "is_regex": {"type": "boolean", "description": "是否將 query 視為 regex。預設 false。"},
+                        "case_sensitive": {"type": "boolean", "description": "是否區分大小寫。預設 false。"},
+                        "max_results": {"type": "integer", "description": "最多回傳幾筆結果，預設 50，上限 200。"},
+                    },
+                    "required": ["query"],
+                },
+                handler_name="_tool_grep_search",
+            ),
+            AgentToolSpec(
                 name="write_file",
                 description="直接寫入完整檔案內容；可用於建立新檔案，或在重新 read_file 後覆寫整個既有檔案。",
                 parameters={
@@ -1068,6 +1084,40 @@ class CodingAgent:
         del progress_callback
         path = self._require_string_argument(action, "path")
         return ({"path": path, "result": self.workspace.read_file(user_id, path)}, [], current_task_items)
+
+    async def _tool_grep_search(
+        self,
+        user_id: int,
+        action: dict[str, Any],
+        current_task_items: list[AgentTaskItem],
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], list[str], list[AgentTaskItem]]:
+        del progress_callback
+        query = self._require_string_argument(action, "query")
+        path = str(action.get("path") or ".")
+        is_regex = self._coerce_bool(action.get("is_regex"), default=False)
+        case_sensitive = self._coerce_bool(action.get("case_sensitive"), default=False)
+        max_results = action.get("max_results", 50)
+        if not isinstance(max_results, int):
+            try:
+                max_results = int(max_results)
+            except (TypeError, ValueError):
+                max_results = 50
+        return (
+            {
+                "path": path,
+                "result": self.workspace.grep_search(
+                    user_id,
+                    query,
+                    path,
+                    is_regex=is_regex,
+                    case_sensitive=case_sensitive,
+                    max_results=max_results,
+                ),
+            },
+            [],
+            current_task_items,
+        )
 
     async def _tool_write_file(
         self,

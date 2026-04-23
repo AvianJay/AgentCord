@@ -530,7 +530,7 @@ def register_commands(bot: AgentCordBot) -> None:
         ]
 
     @bot.tree.command(name="custom-model", description="設定非 Pollinations 的模型供應商。")
-    @app_commands.describe(provider="供應商類型。", api_key="供應商 API 金鑰。", model="供應商模型名稱。")
+    @app_commands.describe(provider="供應商類型。", api_key="供應商 API 金鑰；custom 時請填 {apiurl}:{apikey}。", model="供應商模型名稱。")
     @app_commands.choices(
         provider=[
             app_commands.Choice(name="OpenAI", value=Provider.OPENAI.value),

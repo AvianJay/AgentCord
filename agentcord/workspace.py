@@ -5,6 +5,7 @@ import fnmatch
 import io
 import json
 import py_compile
+import re
 import shutil
 import time
 import tempfile
@@ -74,6 +75,77 @@ class WorkspaceManager:
         if not absolute.is_file():
             raise WorkspaceError(f"找不到檔案：{path}")
         return absolute.read_text(encoding="utf-8")
+
+    def grep_search(
+        self,
+        user_id: int,
+        query: str,
+        path: str = ".",
+        *,
+        is_regex: bool = False,
+        case_sensitive: bool = False,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        absolute = self._resolve_path(user_id, path)
+        if not absolute.exists():
+            raise WorkspaceError(f"找不到路徑：{path}")
+
+        needle = query.strip()
+        if not needle:
+            raise WorkspaceError("grep_search 的 query 不可為空。")
+
+        limit = max(1, min(max_results, 200))
+        pattern: re.Pattern[str] | None = None
+        if is_regex:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            try:
+                pattern = re.compile(query, flags)
+            except re.error as exc:
+                raise WorkspaceError(f"grep_search 的 regex 無效：{exc}") from exc
+
+        files = [absolute] if absolute.is_file() else [item for item in sorted(absolute.rglob("*")) if item.is_file()]
+        root = self.user_root(user_id)
+        matches: list[dict[str, Any]] = []
+        truncated = False
+        comparison_needle = needle if case_sensitive else needle.lower()
+
+        for file_path in files:
+            relative_path = file_path.relative_to(root).as_posix()
+            if self._is_internal_review_path(relative_path):
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if pattern is not None:
+                    matched = pattern.search(line) is not None
+                else:
+                    haystack = line if case_sensitive else line.lower()
+                    matched = comparison_needle in haystack
+                if not matched:
+                    continue
+                if len(matches) >= limit:
+                    truncated = True
+                    break
+                matches.append(
+                    {
+                        "path": relative_path,
+                        "line": line_number,
+                        "text": line,
+                    }
+                )
+            if truncated:
+                break
+
+        return {
+            "path": self._to_relative(user_id, absolute),
+            "query": query,
+            "is_regex": is_regex,
+            "case_sensitive": case_sensitive,
+            "matches": matches,
+            "truncated": truncated,
+        }
 
     def file_exists(self, user_id: int, path: str) -> bool:
         absolute = self._resolve_path(user_id, path)

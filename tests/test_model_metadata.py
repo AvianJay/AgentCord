@@ -42,6 +42,13 @@ class _FakeSession:
             raise AssertionError(f"Unexpected GET {url}")
         return _FakeResponse(queue.pop(0))
 
+    def post(self, url: str, **kwargs):
+        self.calls.append((url, kwargs))
+        queue = self._payloads.get(url)
+        if not queue:
+            raise AssertionError(f"Unexpected POST {url}")
+        return _FakeResponse(queue.pop(0))
+
 
 def _make_settings(root: Path) -> Settings:
     return Settings(
@@ -183,6 +190,37 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models[0].description, "Claude Sonnet on Poe")
         self.assertIsNone(models[0].context_length)
 
+    async def test_fetch_custom_models_uses_combined_apiurl_and_proxy(self) -> None:
+        session = _FakeSession(
+            {
+                "https://api.example.com/v1/models": [
+                    {
+                        "data": [
+                            {
+                                "id": "custom-coder",
+                                "description": "Private coding model",
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+        settings = _make_settings(Path(tempfile.gettempdir()))
+        settings.proxy_url = "http://proxy.local:8080"
+
+        models = await ai.fetch_provider_models(
+            session,
+            settings,
+            Provider.CUSTOM,
+            "https://api.example.com/v1:secret-token",
+            force_refresh=True,
+        )
+
+        self.assertEqual([model.name for model in models], ["custom-coder"])
+        self.assertEqual(session.calls[0][0], "https://api.example.com/v1/models")
+        self.assertEqual(session.calls[0][1]["headers"]["Authorization"], "Bearer secret-token")
+        self.assertEqual(session.calls[0][1]["proxy"], "http://proxy.local:8080")
+
     def test_create_provider_supports_poe_openai_compatible_endpoint(self) -> None:
         settings = _make_settings(Path(tempfile.gettempdir()))
         config = UserModelConfig(provider=Provider.POE, api_key="poe-test-key", model="Claude-Sonnet-4.5")
@@ -191,6 +229,55 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(provider, ai.OpenAICompatibleProvider)
         self.assertEqual(provider.base_url, "https://api.poe.com/v1")
+
+    def test_create_provider_supports_custom_combined_apiurl_and_api_key(self) -> None:
+        settings = _make_settings(Path(tempfile.gettempdir()))
+        config = UserModelConfig(
+            provider=Provider.CUSTOM,
+            api_key="https://api.example.com/v1:secret-token",
+            model="custom-coder",
+        )
+
+        provider = ai.create_provider(object(), settings, config)
+
+        self.assertIsInstance(provider, ai.OpenAICompatibleProvider)
+        self.assertEqual(provider.base_url, "https://api.example.com/v1")
+        self.assertEqual(provider.request_api_key, "secret-token")
+        self.assertTrue(provider.require_proxy)
+
+    async def test_openai_compatible_provider_strips_thinking_preface(self) -> None:
+        session = _FakeSession(
+            {
+                "https://api.openai.com/v1/chat/completions": [
+                    {
+                        "model": "gpt-4.1",
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "Thinking...\n\n真正答案"
+                                }
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        settings = _make_settings(Path(tempfile.gettempdir()))
+        provider = ai.OpenAICompatibleProvider(
+            session,
+            settings,
+            UserModelConfig(provider=Provider.OPENAI, api_key="sk-test", model="gpt-4.1"),
+            "https://api.openai.com/v1",
+        )
+
+        response = await provider.generate([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(response.content, "真正答案")
+
+    def test_parse_json_object_ignores_thinking_blocks(self) -> None:
+        payload = ai.parse_json_object("<think>private reasoning</think>\n```thinking\nstep 1\n```\n{\"plan\": [\"a\"]}")
+
+        self.assertEqual(payload, {"plan": ["a"]})
 
 
 class AgentModelMetadataTests(unittest.IsolatedAsyncioTestCase):
