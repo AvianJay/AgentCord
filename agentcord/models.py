@@ -74,6 +74,14 @@ class PollinationsModelInfo:
 
 
 @dataclass(slots=True)
+class ProviderModelInfo:
+    name: str
+    aliases: list[str] = field(default_factory=list)
+    description: str = ""
+    context_length: int | None = None
+
+
+@dataclass(slots=True)
 class TaskRecord:
     id: int
     user_id: int

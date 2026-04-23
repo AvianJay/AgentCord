@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from agentcord.ai import PollinationsProvider, create_provider, parse_json_object, resolve_pollinations_model
+from agentcord.ai import PollinationsProvider, create_provider, parse_json_object, resolve_model_info
 from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.models import AIUsage, AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
@@ -139,11 +139,9 @@ class CodingAgent:
     ) -> AgentRunResult:
         config = self.db.get_model_config(user_id, self.settings.default_pollinations_model)
         provider = create_provider(self.session, self.settings, config)
-        model_info = None
-        if config.provider is Provider.POLLINATIONS:
-            model_info = await resolve_pollinations_model(self.session, self.settings, config.model)
+        model_info = await resolve_model_info(self.session, self.settings, config)
         context_length = model_info.context_length if model_info is not None else None
-        actual_model = config.model
+        actual_model = model_info.name if model_info is not None else config.model
 
         history_messages = list(task.messages) if task is not None else []
         if not history_messages or history_messages[-1].role != "user" or history_messages[-1].content != prompt:
@@ -336,11 +334,9 @@ class CodingAgent:
     ) -> AgentPlanResult:
         config = self.db.get_model_config(user_id, self.settings.default_pollinations_model)
         provider = create_provider(self.session, self.settings, config)
-        model_info = None
-        if config.provider is Provider.POLLINATIONS:
-            model_info = await resolve_pollinations_model(self.session, self.settings, config.model)
+        model_info = await resolve_model_info(self.session, self.settings, config)
         context_length = model_info.context_length if model_info is not None else None
-        current_model = config.model
+        current_model = model_info.name if model_info is not None else config.model
         history_messages = list(task.messages) if task is not None else []
         if prompt.strip():
             history_messages.append(ConversationMessage(role="user", content=prompt))

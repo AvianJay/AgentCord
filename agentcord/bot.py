@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from agentcord.agent import CodingAgent, CreditManager
-from agentcord.ai import create_provider, fetch_pollinations_models, resolve_pollinations_model
+from agentcord.ai import create_provider, fetch_pollinations_models, fetch_provider_models, resolve_pollinations_model, resolve_provider_model
 from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.logger import DiscordWebhookLogger
@@ -530,26 +530,115 @@ def register_commands(bot: AgentCordBot) -> None:
         ]
 
     @bot.tree.command(name="custom-model", description="設定非 Pollinations 的模型供應商。")
-    @app_commands.describe(provider="供應商類型：openai / anthropic / google / xai / custom", api_key="供應商 API 金鑰。", model="供應商模型名稱。")
-    async def custom_model(interaction: discord.Interaction, provider: str, api_key: str, model: str) -> None:
+    @app_commands.describe(provider="供應商類型。", api_key="供應商 API 金鑰。", model="供應商模型名稱。")
+    @app_commands.choices(
+        provider=[
+            app_commands.Choice(name="OpenAI", value=Provider.OPENAI.value),
+            app_commands.Choice(name="Anthropic", value=Provider.ANTHROPIC.value),
+            app_commands.Choice(name="Google", value=Provider.GOOGLE.value),
+            app_commands.Choice(name="xAI", value=Provider.XAI.value),
+            app_commands.Choice(name="自訂 OpenAI 相容", value=Provider.CUSTOM.value),
+        ]
+    )
+    async def custom_model(
+        interaction: discord.Interaction,
+        provider: app_commands.Choice[str],
+        api_key: str,
+        model: str,
+    ) -> None:
+        assert bot.http_session is not None
+        provider_value = Provider(provider.value)
+        normalized_model = model.strip()
+        model_info = None
+        model_lookup_note = ""
         try:
-            provider_value = Provider(provider.lower())
-        except ValueError as exc:
-            raise ValueError(f"不支援的供應商：{provider}") from exc
-        config = UserModelConfig(provider=provider_value, api_key=api_key.strip(), model=model.strip())
+            model_info = await resolve_provider_model(
+                bot.http_session,
+                bot.settings,
+                provider_value,
+                api_key.strip(),
+                normalized_model,
+            )
+        except aiohttp.ClientResponseError as exc:
+            if exc.status not in {404, 405, 501}:
+                raise
+            model_lookup_note = "供應商未提供模型列表，已保留手動輸入的模型名稱。"
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            raise
+        except Exception:
+            model_lookup_note = "目前無法取得模型資訊，已保留手動輸入的模型名稱。"
+
+        if model_info is not None:
+            normalized_model = model_info.name
+
+        config = UserModelConfig(provider=provider_value, api_key=api_key.strip(), model=normalized_model)
         bot.db.set_model_config(interaction.user.id, config)
+        log_fields = [
+            ("供應商", config.provider.value, True),
+            ("模型", config.model, True),
+        ]
+        if model_info is not None:
+            log_fields.append(("Context", str(model_info.context_length or "?"), True))
+        elif model_lookup_note:
+            log_fields.append(("模型資訊", model_lookup_note, False))
         await log_interaction(
             interaction,
             "更新自訂模型設定。",
-            fields=[
-                ("供應商", config.provider.value, True),
-                ("模型", config.model, True),
-            ],
+            fields=log_fields,
         )
-        await interaction.response.send_message(
-            f"自訂模型已設定為 {config.provider.value}/{config.model}。",
-            ephemeral=True,
-        )
+        response_lines = [f"自訂模型已設定為 {config.provider.value}/{config.model}。"]
+        if model_info is not None:
+            if model_info.context_length is not None:
+                response_lines.append(f"Context length：{model_info.context_length:,}")
+            else:
+                response_lines.append("Context length：未知")
+        elif model_lookup_note:
+            response_lines.append(model_lookup_note)
+        await interaction.response.send_message("\n".join(response_lines), ephemeral=True)
+
+    @custom_model.autocomplete("model")
+    async def custom_model_autocomplete(
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        assert bot.http_session is not None
+        provider_input = getattr(interaction.namespace, "provider", "")
+        provider_raw = getattr(provider_input, "value", provider_input)
+        api_key = str(getattr(interaction.namespace, "api_key", "") or "").strip()
+        if not provider_raw:
+            return []
+        try:
+            provider_value = Provider(str(provider_raw).lower())
+        except ValueError:
+            return []
+        if not api_key:
+            return []
+
+        try:
+            models = await fetch_provider_models(bot.http_session, bot.settings, provider_value, api_key)
+        except Exception:
+            return []
+
+        current_lower = current.lower().strip()
+        filtered = [
+            model_info
+            for model_info in models
+            if not current_lower
+            or current_lower in model_info.name.lower()
+            or current_lower in model_info.description.lower()
+            or any(current_lower in alias.lower() for alias in model_info.aliases)
+        ]
+        return [
+            app_commands.Choice(
+                name=format_model_choice_name(
+                    model_info.name,
+                    model_info.context_length,
+                    model_info.description,
+                ),
+                value=model_info.name,
+            )
+            for model_info in filtered[:25]
+        ]
 
     file_manager = app_commands.Group(name="file-manager", description="瀏覽並編輯你的工作區檔案。")
 

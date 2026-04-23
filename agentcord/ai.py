@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from abc import ABC, abstractmethod
@@ -8,10 +9,15 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 
 from agentcord.config import Settings
-from agentcord.models import AIResponse, AIUsage, PollinationsModelInfo, Provider, UserModelConfig, estimate_tokens
+from agentcord.models import AIResponse, AIUsage, PollinationsModelInfo, Provider, ProviderModelInfo, UserModelConfig, estimate_tokens
 
 _POLLINATIONS_MODELS_CACHE_TTL = 900.0
 _pollinations_models_cache: tuple[float, list[PollinationsModelInfo], dict[str, PollinationsModelInfo]] | None = None
+_PROVIDER_MODELS_CACHE_TTL = 900.0
+_provider_models_cache: dict[
+    tuple[str, str, str],
+    tuple[float, list[ProviderModelInfo], dict[str, ProviderModelInfo]],
+] = {}
 
 
 def _resolve_response_model(payload: Any) -> str | None:
@@ -31,6 +37,406 @@ def _request_timeout() -> aiohttp.ClientTimeout:
 def _stream_timeout() -> aiohttp.ClientTimeout:
     # Streaming responses can legitimately take several minutes; only fail when the socket stalls.
     return aiohttp.ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=300)
+
+
+def _model_list_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(total=45, connect=15, sock_connect=15, sock_read=45)
+
+
+def _cache_secret(value: str) -> str:
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_model_name(provider: Provider, value: Any) -> str:
+    name = str(value or "").strip()
+    if provider is Provider.GOOGLE and name.startswith("models/"):
+        return name.split("/", 1)[1].strip()
+    return name
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        int_value = int(value)
+        return int_value if int_value > 0 else None
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if cleaned.isdigit():
+            int_value = int(cleaned)
+            return int_value if int_value > 0 else None
+    return None
+
+
+def _extract_context_length(payload: Any) -> int | None:
+    if isinstance(payload, list):
+        for item in payload:
+            context_length = _extract_context_length(item)
+            if context_length is not None:
+                return context_length
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    for key in (
+        "context_length",
+        "contextLength",
+        "max_context_length",
+        "maxContextLength",
+        "context_window",
+        "contextWindow",
+        "input_token_limit",
+        "inputTokenLimit",
+        "max_input_tokens",
+        "maxInputTokens",
+        "token_limit",
+        "tokenLimit",
+    ):
+        context_length = _coerce_positive_int(payload.get(key))
+        if context_length is not None:
+            return context_length
+
+    for key in ("limits", "metadata", "capabilities", "details", "info"):
+        nested = payload.get(key)
+        context_length = _extract_context_length(nested)
+        if context_length is not None:
+            return context_length
+    return None
+
+
+def _extract_description(payload: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _provider_cache_key(provider: Provider, api_key: str, *, base_url: str = "") -> tuple[str, str, str]:
+    return (provider.value, _cache_secret(api_key.strip()), base_url.rstrip("/"))
+
+
+def _cache_provider_models(
+    provider: Provider,
+    api_key: str,
+    models: list[ProviderModelInfo],
+    *,
+    base_url: str = "",
+) -> list[ProviderModelInfo]:
+    lookup: dict[str, ProviderModelInfo] = {}
+    for model in models:
+        lookup.setdefault(model.name, model)
+        for alias in model.aliases:
+            lookup.setdefault(alias, model)
+    _provider_models_cache[_provider_cache_key(provider, api_key, base_url=base_url)] = (
+        time.time(),
+        models,
+        lookup,
+    )
+    return models
+
+
+def _get_cached_provider_models(
+    provider: Provider,
+    api_key: str,
+    *,
+    base_url: str = "",
+) -> tuple[list[ProviderModelInfo], dict[str, ProviderModelInfo]] | None:
+    cached = _provider_models_cache.get(_provider_cache_key(provider, api_key, base_url=base_url))
+    if cached is None:
+        return None
+    cached_at, models, lookup = cached
+    if time.time() - cached_at >= _PROVIDER_MODELS_CACHE_TTL:
+        return None
+    return models, lookup
+
+
+def _build_provider_model_info(
+    provider: Provider,
+    payload: dict[str, Any],
+    *,
+    name_keys: tuple[str, ...],
+    description_keys: tuple[str, ...],
+    extra_aliases: list[str] | None = None,
+) -> ProviderModelInfo | None:
+    raw_name = ""
+    for key in name_keys:
+        raw_name = str(payload.get(key) or "").strip()
+        if raw_name:
+            break
+    if not raw_name:
+        return None
+
+    name = _normalize_model_name(provider, raw_name)
+    aliases = [alias for alias in extra_aliases or [] if alias and alias != name]
+    if raw_name != name:
+        aliases.append(raw_name)
+
+    return ProviderModelInfo(
+        name=name,
+        aliases=sorted(set(aliases)),
+        description=_extract_description(payload, *description_keys),
+        context_length=_extract_context_length(payload),
+    )
+
+
+def _sort_and_dedupe_models(models: list[ProviderModelInfo]) -> list[ProviderModelInfo]:
+    deduped: dict[str, ProviderModelInfo] = {}
+    for model in models:
+        existing = deduped.get(model.name)
+        if existing is None:
+            deduped[model.name] = model
+            continue
+        if existing.context_length is None and model.context_length is not None:
+            existing.context_length = model.context_length
+        if not existing.description and model.description:
+            existing.description = model.description
+        merged_aliases = set(existing.aliases)
+        merged_aliases.update(model.aliases)
+        existing.aliases = sorted(merged_aliases)
+    return sorted(deduped.values(), key=lambda item: item.name)
+
+
+def _parse_openai_compatible_models(payload: Any, provider: Provider) -> list[ProviderModelInfo]:
+    items: list[dict[str, Any]] = []
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        items = [item for item in payload["data"] if isinstance(item, dict)]
+    elif isinstance(payload, list):
+        items = [item for item in payload if isinstance(item, dict)]
+
+    models: list[ProviderModelInfo] = []
+    for item in items:
+        model = _build_provider_model_info(
+            provider,
+            item,
+            name_keys=("id", "name"),
+            description_keys=("description", "display_name", "owned_by"),
+        )
+        if model is not None:
+            models.append(model)
+    return _sort_and_dedupe_models(models)
+
+
+def _parse_anthropic_models(payload: Any) -> list[ProviderModelInfo]:
+    items: list[dict[str, Any]] = []
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        items = [item for item in payload["data"] if isinstance(item, dict)]
+
+    models: list[ProviderModelInfo] = []
+    for item in items:
+        display_name = str(item.get("display_name") or item.get("displayName") or "").strip()
+        model = _build_provider_model_info(
+            Provider.ANTHROPIC,
+            item,
+            name_keys=("id", "name"),
+            description_keys=("description", "display_name", "displayName"),
+            extra_aliases=[display_name] if display_name else None,
+        )
+        if model is not None:
+            models.append(model)
+    return _sort_and_dedupe_models(models)
+
+
+def _parse_google_models(payload: Any) -> list[ProviderModelInfo]:
+    items: list[dict[str, Any]] = []
+    if isinstance(payload, dict) and isinstance(payload.get("models"), list):
+        items = [item for item in payload["models"] if isinstance(item, dict)]
+
+    models: list[ProviderModelInfo] = []
+    for item in items:
+        supported_methods = item.get("supportedGenerationMethods")
+        if isinstance(supported_methods, list) and supported_methods:
+            supported = {str(method).strip() for method in supported_methods if str(method).strip()}
+            if "generateContent" not in supported and "streamGenerateContent" not in supported:
+                continue
+        display_name = str(item.get("displayName") or item.get("display_name") or "").strip()
+        model = _build_provider_model_info(
+            Provider.GOOGLE,
+            item,
+            name_keys=("name",),
+            description_keys=("description", "displayName", "display_name"),
+            extra_aliases=[display_name] if display_name else None,
+        )
+        if model is not None:
+            models.append(model)
+    return _sort_and_dedupe_models(models)
+
+
+async def _fetch_openai_compatible_models(
+    session: aiohttp.ClientSession,
+    provider: Provider,
+    api_key: str,
+    base_url: str,
+) -> list[ProviderModelInfo]:
+    async with session.get(
+        f"{base_url.rstrip('/')}/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        timeout=_model_list_timeout(),
+    ) as response:
+        response.raise_for_status()
+        payload = await response.json()
+    return _parse_openai_compatible_models(payload, provider)
+
+
+async def _fetch_anthropic_models(session: aiohttp.ClientSession, api_key: str) -> list[ProviderModelInfo]:
+    async with session.get(
+        "https://api.anthropic.com/v1/models",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        timeout=_model_list_timeout(),
+    ) as response:
+        response.raise_for_status()
+        payload = await response.json()
+    return _parse_anthropic_models(payload)
+
+
+async def _fetch_google_models(session: aiohttp.ClientSession, api_key: str) -> list[ProviderModelInfo]:
+    payloads: list[dict[str, Any]] = []
+    page_token = ""
+    for _ in range(10):
+        params = {"key": api_key}
+        if page_token:
+            params["pageToken"] = page_token
+        async with session.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params=params,
+            timeout=_model_list_timeout(),
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
+        if isinstance(payload, dict):
+            payloads.append(payload)
+            page_token = str(payload.get("nextPageToken") or "").strip()
+        else:
+            page_token = ""
+        if not page_token:
+            break
+
+    models: list[ProviderModelInfo] = []
+    for payload in payloads:
+        models.extend(_parse_google_models(payload))
+    return _sort_and_dedupe_models(models)
+
+
+async def fetch_provider_models(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    provider: Provider,
+    api_key: str,
+    *,
+    force_refresh: bool = False,
+) -> list[ProviderModelInfo]:
+    if provider is Provider.POLLINATIONS:
+        return [
+            ProviderModelInfo(
+                name=model.name,
+                aliases=list(model.aliases),
+                description=model.description,
+                context_length=model.context_length,
+            )
+            for model in await fetch_pollinations_models(session, settings, force_refresh=force_refresh)
+        ]
+
+    api_key = api_key.strip()
+    if not api_key:
+        return []
+
+    base_url = ""
+    if provider is Provider.OPENAI:
+        base_url = "https://api.openai.com/v1"
+    elif provider is Provider.XAI:
+        base_url = "https://api.x.ai/v1"
+    elif provider is Provider.CUSTOM:
+        base_url = settings.custom_provider_base_url.strip()
+        if not base_url:
+            raise ValueError("自訂供應商必須設定 AGENTCORD_CUSTOM_PROVIDER_BASE_URL。")
+
+    if not force_refresh:
+        cached = _get_cached_provider_models(provider, api_key, base_url=base_url)
+        if cached is not None:
+            models, _ = cached
+            return models
+
+    if provider in {Provider.OPENAI, Provider.XAI, Provider.CUSTOM}:
+        models = await _fetch_openai_compatible_models(session, provider, api_key, base_url)
+    elif provider is Provider.ANTHROPIC:
+        models = await _fetch_anthropic_models(session, api_key)
+    elif provider is Provider.GOOGLE:
+        models = await _fetch_google_models(session, api_key)
+    else:
+        raise ValueError(f"不支援的供應商：{provider}")
+
+    return _cache_provider_models(provider, api_key, models, base_url=base_url)
+
+
+async def resolve_provider_model(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    provider: Provider,
+    api_key: str,
+    model_name: str,
+) -> ProviderModelInfo | None:
+    if provider is Provider.POLLINATIONS:
+        model = await resolve_pollinations_model(session, settings, model_name)
+        if model is None:
+            return None
+        return ProviderModelInfo(
+            name=model.name,
+            aliases=list(model.aliases),
+            description=model.description,
+            context_length=model.context_length,
+        )
+
+    api_key = api_key.strip()
+    if not api_key:
+        return None
+
+    base_url = ""
+    if provider is Provider.OPENAI:
+        base_url = "https://api.openai.com/v1"
+    elif provider is Provider.XAI:
+        base_url = "https://api.x.ai/v1"
+    elif provider is Provider.CUSTOM:
+        base_url = settings.custom_provider_base_url.strip()
+        if not base_url:
+            raise ValueError("自訂供應商必須設定 AGENTCORD_CUSTOM_PROVIDER_BASE_URL。")
+
+    models = await fetch_provider_models(session, settings, provider, api_key)
+    cached = _get_cached_provider_models(provider, api_key, base_url=base_url)
+    if cached is None:
+        lookup = {model.name: model for model in models}
+        for model in models:
+            for alias in model.aliases:
+                lookup.setdefault(alias, model)
+    else:
+        _, lookup = cached
+
+    normalized_name = _normalize_model_name(provider, model_name)
+    return lookup.get(normalized_name) or lookup.get(model_name.strip())
+
+
+async def resolve_model_info(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    config: UserModelConfig,
+) -> ProviderModelInfo | None:
+    return await resolve_provider_model(
+        session,
+        settings,
+        config.provider,
+        config.api_key,
+        config.model,
+    )
 
 
 class AIProvider(ABC):
