@@ -14,7 +14,7 @@ AI-powered coding agent bot for Discord, built with `discord.py`.
 - Credits system with one-time default balance and owner overrides
 - Pollinations as the default AI provider with per-user model switching
 - Per-user Pterodactyl Client API credentials for agent-side server operations
-- External providers for OpenAI, Anthropic, Google, xAI, and OpenAI-compatible custom endpoints
+- External providers for OpenAI, Anthropic, Google, xAI, Poe, and OpenAI-compatible custom endpoints
 - Task tracking for agent runs
 - Markdown memory notes stored in the workspace
 - Web search via Pollinations `gemini-search` and direct webpage fetching through optional `PROXY_*` settings

@@ -54,9 +54,11 @@ class AgentPatchPromptTests(unittest.TestCase):
 
         self.assertIn("優先從最具體的錨點開始", prompt)
         self.assertIn("若使用者已指定檔案，先 read_file 該檔案", prompt)
+        self.assertIn("局部小改動可優先用 apply_patch", prompt)
         self.assertIn("完成第一次實質修改後，下一步優先做聚焦驗證", prompt)
         self.assertIn("修改 Python 檔案時，優先使用 py_compile_check 驗證", prompt)
         self.assertIn("若 apply_patch 因格式錯誤或上下文不符失敗，先重新 read_file", prompt)
+        self.assertIn("patch 反覆失敗，改用 write_file", prompt)
 
 
 if __name__ == "__main__":

@@ -551,11 +551,11 @@ class WorkspaceManager:
             old_path = file_diff["old_path"]
             new_path = file_diff["new_path"]
             if old_path == "/dev/null":
-                original_lines: list[str] = []
+                working_lines: list[str] = []
                 source_path = new_path
             else:
                 original_text = self.read_file(user_id, old_path)
-                original_lines = original_text.splitlines(keepends=True)
+                working_lines = original_text.splitlines(keepends=True)
                 source_path = old_path
 
             if new_path == "/dev/null":
@@ -563,36 +563,60 @@ class WorkspaceManager:
                 changed_paths.append(source_path)
                 continue
 
-            result_lines: list[str] = []
-            cursor = 0
+            search_start = 0
             for hunk in file_diff["hunks"]:
-                old_start = hunk["old_start"]
-                result_lines.extend(original_lines[cursor : old_start - 1])
-                cursor = old_start - 1
-                for line in hunk["lines"]:
-                    if not line:
-                        continue
-                    prefix = line[0]
-                    payload = line[1:]
-                    if prefix == " ":
-                        if cursor >= len(original_lines) or original_lines[cursor] != payload:
-                            raise WorkspaceError(f"Patch 上下文與 {source_path} 不符。")
-                        result_lines.append(payload)
-                        cursor += 1
-                    elif prefix == "-":
-                        if cursor >= len(original_lines) or original_lines[cursor] != payload:
-                            raise WorkspaceError(f"Patch 刪除內容與 {source_path} 不符。")
-                        cursor += 1
-                    elif prefix == "+":
-                        result_lines.append(payload)
-                if hunk["old_count"] == 0 and old_start == 0:
-                    cursor = 0
-            result_lines.extend(original_lines[cursor:])
-            updated_contents[new_path] = "".join(result_lines)
+                source_lines = [line[1:] for line in hunk["lines"] if line and line[0] in {" ", "-"}]
+                target_lines = [line[1:] for line in hunk["lines"] if line and line[0] in {" ", "+"}]
+                preferred_index = max(0, hunk["old_start"] - 1)
+                match_index = self._find_hunk_match(working_lines, source_lines, preferred_index, search_start)
+                if match_index is None:
+                    raise WorkspaceError(f"Patch 上下文與 {source_path} 不符。")
+                working_lines[match_index : match_index + len(source_lines)] = target_lines
+                search_start = match_index + len(target_lines)
+            updated_contents[new_path] = "".join(working_lines)
             changed_paths.append(new_path)
 
         self._write_patch_results(user_id, updated_contents)
         return changed_paths
+
+    def _find_hunk_match(
+        self,
+        lines: list[str],
+        source_lines: list[str],
+        preferred_index: int,
+        minimum_index: int,
+    ) -> int | None:
+        if not source_lines:
+            return max(0, min(max(preferred_index, minimum_index), len(lines)))
+
+        max_start = len(lines) - len(source_lines)
+        if max_start < 0:
+            return None
+
+        preferred_index = min(max(preferred_index, 0), max_start)
+        minimum_index = min(max(minimum_index, 0), max_start)
+
+        if preferred_index >= minimum_index and self._lines_match(lines, preferred_index, source_lines):
+            return preferred_index
+
+        candidates = [
+            index
+            for index in range(minimum_index, max_start + 1)
+            if self._lines_match(lines, index, source_lines)
+        ]
+        if not candidates and minimum_index > 0:
+            candidates = [
+                index
+                for index in range(0, minimum_index)
+                if self._lines_match(lines, index, source_lines)
+            ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda index: (abs(index - preferred_index), index))
+
+    def _lines_match(self, lines: list[str], start: int, expected: list[str]) -> bool:
+        end = start + len(expected)
+        return lines[start:end] == expected
 
     def _write_patch_results(self, user_id: int, updated_contents: dict[str, str | None]) -> None:
         current_total = self.total_size(user_id)

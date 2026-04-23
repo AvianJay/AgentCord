@@ -356,6 +356,8 @@ async def fetch_provider_models(
         base_url = "https://api.openai.com/v1"
     elif provider is Provider.XAI:
         base_url = "https://api.x.ai/v1"
+    elif provider is Provider.POE:
+        base_url = "https://api.poe.com/v1"
     elif provider is Provider.CUSTOM:
         base_url = settings.custom_provider_base_url.strip()
         if not base_url:
@@ -367,7 +369,7 @@ async def fetch_provider_models(
             models, _ = cached
             return models
 
-    if provider in {Provider.OPENAI, Provider.XAI, Provider.CUSTOM}:
+    if provider in {Provider.OPENAI, Provider.XAI, Provider.POE, Provider.CUSTOM}:
         models = await _fetch_openai_compatible_models(session, provider, api_key, base_url)
     elif provider is Provider.ANTHROPIC:
         models = await _fetch_anthropic_models(session, api_key)
@@ -406,6 +408,8 @@ async def resolve_provider_model(
         base_url = "https://api.openai.com/v1"
     elif provider is Provider.XAI:
         base_url = "https://api.x.ai/v1"
+    elif provider is Provider.POE:
+        base_url = "https://api.poe.com/v1"
     elif provider is Provider.CUSTOM:
         base_url = settings.custom_provider_base_url.strip()
         if not base_url:
@@ -745,6 +749,8 @@ def create_provider(
         return OpenAICompatibleProvider(session, settings, config, "https://api.openai.com/v1")
     if config.provider is Provider.XAI:
         return OpenAICompatibleProvider(session, settings, config, "https://api.x.ai/v1")
+    if config.provider is Provider.POE:
+        return OpenAICompatibleProvider(session, settings, config, "https://api.poe.com/v1")
     if config.provider is Provider.CUSTOM:
         if not settings.custom_provider_base_url:
             raise ValueError("自訂供應商必須設定 AGENTCORD_CUSTOM_PROVIDER_BASE_URL。")

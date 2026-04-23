@@ -477,7 +477,7 @@ class CodingAgent:
             ),
             AgentToolSpec(
                 name="write_file",
-                description="直接寫入完整檔案內容；若是修改既有檔案，通常應優先使用 apply_patch。",
+                description="直接寫入完整檔案內容；可用於建立新檔案，或在重新 read_file 後覆寫整個既有檔案。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -2309,7 +2309,8 @@ apply_patch 的 diff 必須符合下列格式：
 - 每個檔案區段都必須包含 --- 舊路徑、+++ 新路徑、以及 @@ hunk header。
 - 路徑必須是工作區相對路徑；可以有 a/ 與 b/ 前綴。
 - 不要輸出 *** Begin Patch、*** Update File、JSON patch、或只有 +/- 內容但沒有檔案 header/hunk header 的片段。
-- 若 apply_patch 因格式錯誤或上下文不符而失敗，先重新 read_file，再送出修正後的 unified diff；若檔案很小，也可改用 write_file 寫入完整內容。
+- apply_patch 較適合局部修改；若要重寫大半個檔案或整個小檔案，直接使用 write_file 通常更可靠。
+- 若 apply_patch 因格式錯誤或上下文不符而失敗，先重新 read_file，再依最新內容重建並重送 unified diff；若 patch 仍不穩定，可改用 write_file 寫入完整最新內容。
 
 合法範例：
 --- src/controllers/posts.ts
@@ -2328,6 +2329,7 @@ _EDITING_WORKFLOW_GUIDANCE = """
 - 若使用者已指定檔案，先 read_file 該檔案；不要先做大範圍 list_files 或漫無目的探索。
 - 第一次修改前，只讀取足夠形成單一本地假設與一個便宜驗證檢查的上下文；避免一次讀太多不相關檔案。
 - 編輯既有檔案前，必須以目前最新的 read_file 內容為準產生 diff。
+- 局部小改動可優先用 apply_patch；若要重寫大半個檔案、整個小檔案，或 patch 反覆失敗，改用 write_file。
 - 優先做小而局部的修改；不要重排、重命名、格式化或改寫與需求無關的區段。
 - 完成第一次實質修改後，下一步優先做聚焦驗證：先選最便宜且最能否證當前修改的檢查。
 - 修改 Python 檔案時，優先使用 py_compile_check 驗證；修改非 Python 檔案時，至少重新 read_file 檢查結果是否真的落盤。
@@ -2342,7 +2344,7 @@ _AGENT_SYSTEM_PROMPT_PREFIX = (
 重要規則：
 - 使用者不能執行程式碼。
 - 只可使用下方列出的 tools。
-- 編輯既有檔案時優先使用 apply_patch。
+- 編輯既有檔案時，請選擇最可靠的工具：局部修改用 apply_patch，整檔改寫用 write_file。
 - 只可寫入 UTF-8 文字檔。
 - 只回傳合法 JSON。
 - summary 與 related_files 內容請使用繁體中文。

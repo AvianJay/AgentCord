@@ -11,6 +11,7 @@ class Provider(StrEnum):
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
     XAI = "xai"
+    POE = "poe"
     CUSTOM = "custom"
 
 

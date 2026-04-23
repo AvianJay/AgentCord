@@ -537,6 +537,7 @@ def register_commands(bot: AgentCordBot) -> None:
             app_commands.Choice(name="Anthropic", value=Provider.ANTHROPIC.value),
             app_commands.Choice(name="Google", value=Provider.GOOGLE.value),
             app_commands.Choice(name="xAI", value=Provider.XAI.value),
+            app_commands.Choice(name="Poe", value=Provider.POE.value),
             app_commands.Choice(name="自訂 OpenAI 相容", value=Provider.CUSTOM.value),
         ]
     )

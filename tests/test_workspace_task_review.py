@@ -71,6 +71,20 @@ class WorkspaceTaskReviewTests(unittest.TestCase):
         review_root = self.workspace.user_root(self.user_id) / ".agentcord" / f"task-{self.task_id}"
         self.assertFalse(review_root.exists())
 
+    def test_apply_patch_finds_matching_hunk_when_line_numbers_are_stale(self) -> None:
+        self.workspace.write_file(self.user_id, "src/app.ts", "const preface = 0;\nconst value = 1;\nreturn value;\n")
+
+        changed = self.workspace.apply_patch(
+            self.user_id,
+            "--- src/app.ts\n+++ src/app.ts\n@@ -1,2 +1,2 @@\n const value = 1;\n-return value;\n+return value + 1;\n",
+        )
+
+        self.assertEqual(changed, ["src/app.ts"])
+        self.assertEqual(
+            self.workspace.read_file(self.user_id, "src/app.ts"),
+            "const preface = 0;\nconst value = 1;\nreturn value + 1;\n",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

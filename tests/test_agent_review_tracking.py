@@ -40,8 +40,7 @@ class AgentReviewTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.user_id = 123
         self.task_id = 9
 
-    async def test_write_file_tracks_original_version_for_review(self) -> None:
-        self.workspace.write_file(self.user_id, "src/app.ts", "const value = 1;\n")
+    async def test_write_file_creates_new_file_and_tracks_review(self) -> None:
         token = _CURRENT_TASK_ID.set(self.task_id)
         self.addCleanup(_CURRENT_TASK_ID.reset, token)
 
@@ -54,6 +53,23 @@ class AgentReviewTrackingTests(unittest.IsolatedAsyncioTestCase):
 
         changes = self.workspace.list_task_file_changes(self.user_id, self.task_id)
         self.assertEqual([item["path"] for item in changes], ["src/app.ts"])
+        diff = self.workspace.get_task_file_change_diff(self.user_id, self.task_id, "src/app.ts")
+        self.assertIn("+const value = 2;", diff["diff"])
+        self.assertEqual(diff["status"], "added")
+
+    async def test_write_file_overwrites_existing_file_and_tracks_original_version(self) -> None:
+        self.workspace.write_file(self.user_id, "src/app.ts", "const value = 1;\n")
+        token = _CURRENT_TASK_ID.set(self.task_id)
+        self.addCleanup(_CURRENT_TASK_ID.reset, token)
+
+        await self.agent._tool_write_file(
+            self.user_id,
+            {"tool": "write_file", "path": "src/app.ts", "content": "const value = 2;\n"},
+            [],
+            None,
+        )
+
+        self.assertEqual(self.workspace.read_file(self.user_id, "src/app.ts"), "const value = 2;\n")
         diff = self.workspace.get_task_file_change_diff(self.user_id, self.task_id, "src/app.ts")
         self.assertIn("-const value = 1;", diff["diff"])
         self.assertIn("+const value = 2;", diff["diff"])

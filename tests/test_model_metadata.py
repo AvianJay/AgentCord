@@ -148,6 +148,50 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.name, "gemini-2.5-pro")
         self.assertEqual(resolved.context_length, 1048576)
 
+    async def test_fetch_poe_models_uses_poe_openai_compatible_catalog(self) -> None:
+        session = _FakeSession(
+            {
+                "https://api.poe.com/v1/models": [
+                    {
+                        "data": [
+                            {
+                                "id": "Claude-Sonnet-4.5",
+                                "description": "Claude Sonnet on Poe",
+                                "owned_by": "Anthropic",
+                            },
+                            {
+                                "id": "GPT-5-Pro",
+                                "description": "OpenAI flagship on Poe",
+                                "owned_by": "OpenAI",
+                            },
+                        ]
+                    }
+                ]
+            }
+        )
+        settings = _make_settings(Path(tempfile.gettempdir()))
+
+        models = await ai.fetch_provider_models(
+            session,
+            settings,
+            Provider.POE,
+            "poe-test-key",
+            force_refresh=True,
+        )
+
+        self.assertEqual([model.name for model in models], ["Claude-Sonnet-4.5", "GPT-5-Pro"])
+        self.assertEqual(models[0].description, "Claude Sonnet on Poe")
+        self.assertIsNone(models[0].context_length)
+
+    def test_create_provider_supports_poe_openai_compatible_endpoint(self) -> None:
+        settings = _make_settings(Path(tempfile.gettempdir()))
+        config = UserModelConfig(provider=Provider.POE, api_key="poe-test-key", model="Claude-Sonnet-4.5")
+
+        provider = ai.create_provider(object(), settings, config)
+
+        self.assertIsInstance(provider, ai.OpenAICompatibleProvider)
+        self.assertEqual(provider.base_url, "https://api.poe.com/v1")
+
 
 class AgentModelMetadataTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
