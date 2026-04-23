@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from dataclasses import replace
 from unittest import mock
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ class _FakeBot:
         self.logged_events: list[tuple[str, str]] = []
         self.logged_exceptions: list[tuple[str, str]] = []
         self.interaction_messages: list[tuple[str, bool]] = []
+        self.db = _FakeDB()
 
     async def log_event(self, title: str, description: str, **kwargs) -> None:
         del kwargs
@@ -36,6 +38,39 @@ class _FakeBot:
     async def send_interaction_message(self, interaction, message: str | None = None, *, ephemeral: bool = False, **kwargs) -> None:
         del interaction, kwargs
         self.interaction_messages.append((message or "", ephemeral))
+
+
+class _FakeDB:
+    def __init__(self) -> None:
+        self.task: TaskRecord | None = None
+
+    def get_task_by_id(self, task_id: int) -> TaskRecord:
+        assert self.task is not None
+        self.assert_task_id(task_id)
+        return self.task
+
+    def update_task(self, task_id: int, status: TaskStatus, related_files: list[str], **kwargs) -> TaskRecord:
+        assert self.task is not None
+        self.assert_task_id(task_id)
+        self.task = replace(
+            self.task,
+            status=status,
+            related_files=list(related_files),
+            summary=kwargs.get("summary", self.task.summary),
+            plan=list(kwargs.get("plan", self.task.plan)),
+            validations=list(kwargs.get("validations", self.task.validations)),
+            messages=list(kwargs.get("messages", self.task.messages)),
+            task_items=list(kwargs.get("task_items", self.task.task_items)),
+            model=kwargs.get("model", self.task.model),
+            context_length=kwargs.get("context_length", self.task.context_length),
+            compression_count=kwargs.get("compression_count", self.task.compression_count),
+        )
+        return self.task
+
+    def assert_task_id(self, task_id: int) -> None:
+        assert self.task is not None
+        if self.task.id != task_id:
+            raise AssertionError(f"unexpected task id: {task_id}")
 
 
 class _FakeChannelMessage:
@@ -61,6 +96,17 @@ class _FakeChannel:
         return self.fetched_message
 
 
+class _FakeRunningTask:
+    def __init__(self) -> None:
+        self.cancel_called = False
+
+    def done(self) -> bool:
+        return False
+
+    def cancel(self) -> None:
+        self.cancel_called = True
+
+
 class _RecordingSession(AgentConversationSession):
     def __init__(self, bot: _FakeBot) -> None:
         task = TaskRecord(
@@ -71,6 +117,7 @@ class _RecordingSession(AgentConversationSession):
             related_files=[],
         )
         user = SimpleNamespace(id=123)
+        bot.db.task = task
         super().__init__(bot, user, task)
         self.worker_started = asyncio.Event()
 
@@ -139,6 +186,43 @@ class LiveAgentResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(session.message, channel_message)
         self.assertEqual(channel.fetch_calls, [42])
+
+    async def test_handle_session_timeout_closes_idle_session_with_reopen_notice(self) -> None:
+        bot = _FakeBot()
+        session = _RecordingSession(bot)
+
+        await session.handle_session_timeout()
+
+        self.assertTrue(session._closed)
+        self.assertTrue(any("/agent-open 9" in entry.text for entry in session._activity_lines))
+
+    async def test_handle_session_timeout_pauses_busy_session(self) -> None:
+        bot = _FakeBot()
+        session = _RecordingSession(bot)
+        session._current_run_task = _FakeRunningTask()
+        await session._prompt_queue.put("queued prompt")
+
+        await session.handle_session_timeout()
+
+        self.assertTrue(session._timeout_pause_requested)
+        self.assertEqual(session._prompt_queue.qsize(), 0)
+        self.assertTrue(session._current_run_task.cancel_called)
+        self.assertFalse(session._closed)
+        self.assertTrue(any("/agent-open 9" in entry.text for entry in session._activity_lines))
+
+    async def test_finalize_timeout_pause_marks_task_pending(self) -> None:
+        bot = _FakeBot()
+        session = _RecordingSession(bot)
+        session.task_record = replace(session.task_record, status=TaskStatus.RUNNING, summary="working")
+        bot.db.task = session.task_record
+        session._timeout_pause_requested = True
+
+        await session._finalize_timeout_pause()
+
+        self.assertEqual(session.task_record.status, TaskStatus.PENDING)
+        self.assertEqual(session.task_record.summary, "working")
+        self.assertTrue(session._closed)
+        self.assertEqual(bot.logged_events[-1][0], "Agent 暫停")
 
     @staticmethod
     async def _async_noop(*args, **kwargs) -> None:

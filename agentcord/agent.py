@@ -255,33 +255,38 @@ class CodingAgent:
                 )
                 changed_files.update(touched_files)
 
-                validations.extend(self._validate_changed_python_files(user_id, touched_files))
+                iteration_validations = self._validate_changed_python_files(user_id, touched_files)
+                validations.extend(iteration_validations)
                 if validations:
                     await self._emit_activity(
                         progress_callback,
                         f"目前累積 {len(validations)} 筆驗證結果。",
                         activity_key="validation",
                     )
+                final_summary = str(decision.get("summary", final_summary))
+                iteration_record = self._build_iteration_result_record(
+                    iteration,
+                    final_summary,
+                    tool_results,
+                    iteration_validations,
+                    current_task_items,
+                )
                 transcript.append(
                     {
                         "role": "assistant",
-                        "content": json.dumps(
-                            {
-                                "decision": decision,
-                                "tool_results": tool_results,
-                                "validations": validations[-len(touched_files) :] if touched_files else [],
-                            },
-                            ensure_ascii=False,
-                        ),
+                        "content": json.dumps(iteration_record, ensure_ascii=False),
                     }
                 )
-                final_summary = str(decision.get("summary", final_summary))
+                self._append_conversation_message(
+                    "tool",
+                    json.dumps(iteration_record, ensure_ascii=False),
+                )
                 await self._emit_activity(
                     progress_callback,
                     f"目前摘要：{final_summary}",
                     activity_key="summary",
                 )
-                if decision.get("done"):
+                if self._coerce_bool(decision.get("done"), default=False):
                     break
 
             related_files = sorted(changed_files)
@@ -859,6 +864,25 @@ class CodingAgent:
     def _build_ai_tools(self) -> list[dict[str, Any]]:
         return [spec.as_function_schema() for spec in self._tool_specs.values()]
 
+    def _build_iteration_result_record(
+        self,
+        iteration: int,
+        summary: str,
+        tool_results: list[dict[str, Any]],
+        validations: list[str],
+        current_task_items: list[AgentTaskItem],
+    ) -> dict[str, Any]:
+        return {
+            "iteration": iteration,
+            "summary": summary,
+            "tool_results": tool_results,
+            "validations": validations,
+            "tasks": [
+                {"title": item.title, "status": item.status}
+                for item in current_task_items
+            ],
+        }
+
     def _build_agent_system_prompt(self) -> str:
         tool_schema = json.dumps(self._build_ai_tools(), ensure_ascii=False, indent=2)
         return (
@@ -881,7 +905,10 @@ class CodingAgent:
             + "- `tool` 必須對應到上面的 function.name。\n"
             + "- 其他欄位必須符合對應 function.parameters。\n"
             + "- 若不需要任何工具，actions 請回傳空陣列。\n"
-            + "- summary 與 related_files 請反映這一輪實際結果。"
+            + "- summary 與 related_files 請反映這一輪實際結果。\n"
+            + "- done=true 只適用於：整體需求已完成、這一輪已沒有預期中的下一步、沒有等待使用者回覆、也不需要再做工具操作或驗證。\n"
+            + "- 若只是完成其中一個子任務、剛更新 tasks、剛送出中途訊息、剛做完局部修改、仍需繼續檢查或還有未完成事項，done 應為 false。\n"
+            + "- 若你不確定是否真的完成整體需求，預設使用 done=false，並在 summary 說明下一步。"
         )
 
     def _extract_decision_actions(self, decision: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2402,9 +2429,13 @@ _AGENT_SYSTEM_PROMPT_PREFIX = (
 - 可使用 send_message 在執行中直接對使用者說明你正在做什麼、遇到什麼情況、或通知下一步。
 - 若需要使用者做明確決策，請使用 ask_user_choice，而不是自己猜測。它支援單選、多選與自由輸入，收到回覆後再繼續操作。
 - 若使用者已透過 /set-pterodactyl 設定 Pterodactyl Client API，可使用 pterodactyl_request 查詢或操作其有權限的伺服器資源。
+- 若使用者提到託管、主機、面板、開服、部署到面板、伺服器管理等字眼，除非上下文明確另指，預設是在說 Pterodactyl 相關操作。
 - pterodactyl_sync_workspace 可將工作區推到伺服器，也可從伺服器拉回工作區；兩個方向都會套用 ignore_patterns，且在列舉與同步階段都會自動忽略 .npm、.venv、venv、node_modules、__pycache__ 等大型或衍生目錄。
 - pterodactyl_read_console 只能擷取建立連線後的 live 輸出；若要觀察啟動過程，請在 power_action 後立刻呼叫，必要時再搭配 sleep。
 - 如果目前工作有明確步驟，請使用 tasks 工具更新工作清單，好讓使用者看到目前進度。
+- done=true 代表你判定整體需求已完成，沒有預期中的下一步，也不需要再做讀檔、修改、驗證、詢問使用者或其他工具操作。
+- 若只是完成部分 task、剛做完一小段修改、剛更新 tasks、剛送出中途說明、還打算繼續檢查或還有任何未完成事項，done 必須是 false。
+- 若不確定是否已完整完成，寧可先回 done=false，並在 summary 清楚寫出接下來要做什麼。
 
 apply_patch 格式要求：
 """

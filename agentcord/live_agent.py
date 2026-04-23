@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 _MESSAGE_LIMIT = 2000
+_SESSION_REOPEN_WARNING_SECONDS = 14 * 60
+_SESSION_REOPEN_GRACE_SECONDS = 60
 
 
 @dataclass(slots=True)
@@ -91,10 +93,12 @@ class AgentConversationSession:
         self._worker_task: asyncio.Task[None] | None = None
         self._current_run_task: asyncio.Task[object] | None = None
         self._render_task: asyncio.Task[None] | None = None
+        self._timeout_task: asyncio.Task[None] | None = None
         self._render_lock = asyncio.Lock()
         self._closed = False
         self._run_sequence = 0
         self._active_run_scope: str | None = None
+        self._timeout_pause_requested = False
         self._refresh_pending_file_changes()
         if task.summary:
             self._append_activity(f"目前摘要：{task.summary}")
@@ -186,6 +190,7 @@ class AgentConversationSession:
         self.view.sync_layout()
         await interaction.response.send_message(view=self.view)
         self.message = await self._resolve_editable_message(await interaction.original_response())
+        self._start_timeout_watchdog()
 
     async def _resolve_editable_message(self, message: discord.Message) -> discord.Message:
         if not isinstance(message, discord.InteractionMessage):
@@ -199,6 +204,7 @@ class AgentConversationSession:
             return message
 
     async def close(self, reason: str | None = None) -> None:
+        self._cancel_timeout_watchdog()
         self._closed = True
         self._cancel_pending_choice("對話已關閉。")
         if reason:
@@ -206,6 +212,93 @@ class AgentConversationSession:
         self.view.disable_all_items()
         self.view.stop()
         await self.request_render(force=True)
+
+    def _start_timeout_watchdog(self) -> None:
+        self._cancel_timeout_watchdog()
+        self._timeout_task = asyncio.create_task(self._timeout_watchdog())
+
+    def _cancel_timeout_watchdog(self) -> None:
+        timeout_task = self._timeout_task
+        if timeout_task is None:
+            return
+        if timeout_task is asyncio.current_task():
+            return
+        if not timeout_task.done():
+            timeout_task.cancel()
+        self._timeout_task = None
+
+    def _build_reopen_notice(self, *, paused: bool) -> str:
+        command_text = f"/agent-open {self.task_record.id}"
+        if paused:
+            return (
+                f"互動將在 {_SESSION_REOPEN_GRACE_SECONDS} 秒內過期，已暫停目前執行。"
+                f"請使用 {command_text} 重新打開對話後繼續。"
+            )
+        return (
+            f"這個 agent 對話將在 {_SESSION_REOPEN_GRACE_SECONDS} 秒內到達互動時限。"
+            f"若還要繼續查看或操作，請使用 {command_text} 重新打開。"
+        )
+
+    async def _timeout_watchdog(self) -> None:
+        try:
+            await asyncio.sleep(_SESSION_REOPEN_WARNING_SECONDS)
+            await self.handle_session_timeout()
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._timeout_task is asyncio.current_task():
+                self._timeout_task = None
+
+    async def handle_session_timeout(self) -> None:
+        if self._closed:
+            return
+        if self.is_busy():
+            self._timeout_pause_requested = True
+            self._append_activity(self._build_reopen_notice(paused=True))
+            self._cancel_pending_choice("互動即將逾時，請重新打開對話後繼續。")
+            while not self._prompt_queue.empty():
+                try:
+                    self._prompt_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            if self._current_run_task is None or self._current_run_task.done():
+                self._timeout_pause_requested = False
+                await self.close()
+                return
+            await self.request_render(force=True)
+            if self._current_run_task is not None and not self._current_run_task.done():
+                self._current_run_task.cancel()
+            return
+        await self.close(reason=self._build_reopen_notice(paused=False))
+
+    async def _finalize_timeout_pause(self) -> None:
+        self._cancel_timeout_watchdog()
+        self.task_record = self.bot.db.get_task_by_id(self.task_record.id)
+        pause_summary = self.task_record.summary or "已因互動逾時暫停，請重新打開對話後繼續。"
+        self.task_record = self.bot.db.update_task(
+            self.task_record.id,
+            TaskStatus.PENDING,
+            self.task_record.related_files,
+            summary=pause_summary,
+            plan=self.task_record.plan,
+            validations=self.task_record.validations,
+            messages=self._build_persisted_messages(),
+            task_items=self.task_items,
+            model=self.context_state.model or self.task_record.model,
+            context_length=self.context_state.context_length,
+            compression_count=self.context_state.compression_count,
+        )
+        self._closed = True
+        self.view.disable_all_items()
+        self.view.stop()
+        self._timeout_pause_requested = False
+        await self.bot.log_event(
+            "Agent 暫停",
+            f"agent 對話因互動即將逾時而暫停。\nTask ID: {self.task_record.id}",
+            user=self.user,
+            guild=self.guild,
+            color=discord.Colour.orange(),
+        )
 
     async def enqueue_prompt(self, prompt: str) -> None:
         normalized_prompt = str(prompt).strip()
@@ -379,6 +472,9 @@ class AgentConversationSession:
                 result = await self._current_run_task
             except asyncio.CancelledError:
                 self.task_record = self.bot.db.get_task_by_id(self.task_record.id)
+                if self._timeout_pause_requested:
+                    await self._finalize_timeout_pause()
+                    continue
                 self.task_record = self.bot.db.update_task(
                     self.task_record.id,
                     TaskStatus.CANCELLED,
@@ -574,12 +670,12 @@ class AgentConversationSession:
         return entries
 
     def _build_persisted_messages(self) -> list[ConversationMessage]:
-        system_messages = [message for message in self.task_record.messages if message.role == "system"]
+        preserved_messages = [message for message in self.task_record.messages if message.role not in {"user", "assistant"}]
         conversation_messages = [
             ConversationMessage(role=entry.role, content=entry.text)
             for entry in self._conversation_entries
         ]
-        return [*system_messages, *conversation_messages]
+        return [*preserved_messages, *conversation_messages]
 
     def _append_conversation(self, role: str, text: str) -> None:
         normalized = str(text).strip()

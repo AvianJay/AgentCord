@@ -60,6 +60,15 @@ class AgentPatchPromptTests(unittest.TestCase):
         self.assertIn("若 apply_patch 因格式錯誤或上下文不符失敗，先重新 read_file", prompt)
         self.assertIn("patch 反覆失敗，改用 write_file", prompt)
 
+    def test_prompt_maps_hosting_terms_to_pterodactyl_and_warns_against_early_done(self) -> None:
+        prompt = self.agent._build_agent_system_prompt()
+
+        self.assertIn("託管、主機、面板、開服、部署到面板、伺服器管理", prompt)
+        self.assertIn("預設是在說 Pterodactyl 相關操作", prompt)
+        self.assertIn("done=true 代表你判定整體需求已完成", prompt)
+        self.assertIn("若只是完成部分 task", prompt)
+        self.assertIn("若不確定是否已完整完成，寧可先回 done=false", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
