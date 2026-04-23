@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import traceback
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import aiohttp
 import discord
@@ -18,7 +18,7 @@ from agentcord.logger import DiscordWebhookLogger
 from agentcord.live_agent import AgentConversationSession
 from agentcord.models import Provider, TaskRecord, TaskStatus, UserModelConfig, UserPterodactylConfig
 from agentcord.pterodactyl import fetch_pterodactyl_account
-from agentcord.workspace import WorkspaceError, WorkspaceManager
+from agentcord.workspace import WorkspaceEntry, WorkspaceError, WorkspaceManager
 
 
 COMMAND_NAME_TRANSLATIONS = {
@@ -33,6 +33,7 @@ COMMAND_NAME_TRANSLATIONS = {
     "set-pterodactyl": "設定翼手龍",
     "custom-model": "自訂模型",
     "file-manager": "檔案管理",
+    "explorer": "總管",
     "list": "列表",
     "read": "讀取",
     "write": "寫入",
@@ -183,6 +184,19 @@ class AgentCordBot(commands.Bot):
         if fp is not None and hasattr(fp, "seek"):
             fp.seek(0)
 
+    def _build_message_send_kwargs(
+        self,
+        *,
+        file: discord.File | None = None,
+        view: discord.ui.View | discord.ui.LayoutView | None = None,
+    ) -> dict[str, object]:
+        kwargs: dict[str, object] = {}
+        if file is not None:
+            kwargs["file"] = file
+        if view is not None:
+            kwargs["view"] = view
+        return kwargs
+
     async def _send_interaction_fallback(
         self,
         interaction: discord.Interaction,
@@ -210,7 +224,7 @@ class AgentCordBot(commands.Bot):
             dm_content = note if not content else f"{note}\n{content}"
             try:
                 self._reset_interaction_file(file)
-                await interaction.user.send(dm_content, file=file, view=view)
+                await interaction.user.send(dm_content, **self._build_message_send_kwargs(file=file, view=view))
                 return
             except Exception:
                 pass
@@ -223,11 +237,14 @@ class AgentCordBot(commands.Bot):
                 if content:
                     channel_content = f"{channel_content}\n{content}"
             self._reset_interaction_file(file)
-            await channel.send(channel_content or note, file=file, view=None if ephemeral else view)
+            await channel.send(
+                channel_content or note,
+                **self._build_message_send_kwargs(file=file, view=None if ephemeral else view),
+            )
             return
 
         self._reset_interaction_file(file)
-        await interaction.user.send(content or note, file=file, view=view)
+        await interaction.user.send(content or note, **self._build_message_send_kwargs(file=file, view=view))
 
     async def send_interaction_message(
         self,
@@ -240,9 +257,17 @@ class AgentCordBot(commands.Bot):
     ) -> None:
         try:
             if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=ephemeral, file=file, view=view)
+                await interaction.followup.send(
+                    message,
+                    ephemeral=ephemeral,
+                    **self._build_message_send_kwargs(file=file, view=view),
+                )
             else:
-                await interaction.response.send_message(message, ephemeral=ephemeral, file=file, view=view)
+                await interaction.response.send_message(
+                    message,
+                    ephemeral=ephemeral,
+                    **self._build_message_send_kwargs(file=file, view=view),
+                )
             return
         except Exception as exc:
             if not self._is_expired_interaction_error(exc):
@@ -255,6 +280,393 @@ class AgentCordBot(commands.Bot):
                 view=view,
                 error=exc,
             )
+
+
+_WORKSPACE_EXPLORER_TIMEOUT_SECONDS = 14 * 60
+
+
+def _join_workspace_path(base_path: str, child_path: str) -> str:
+    cleaned = str(child_path or "").strip().replace("\\", "/")
+    if not cleaned:
+        raise WorkspaceError("路徑不可為空白。")
+    if cleaned in {".", "/"}:
+        return "."
+    if cleaned.startswith("/"):
+        combined = PurePosixPath(cleaned.lstrip("/"))
+    elif base_path == ".":
+        combined = PurePosixPath(cleaned)
+    else:
+        combined = PurePosixPath(base_path) / cleaned
+    parts = [part for part in combined.parts if part not in {"", "."}]
+    if not parts:
+        return "."
+    return PurePosixPath(*parts).as_posix()
+
+
+def _parent_workspace_path(path: str) -> str:
+    normalized = str(path or ".").strip()
+    if not normalized or normalized == ".":
+        return "."
+    parent = PurePosixPath(normalized).parent
+    return "." if str(parent) in {"", "."} else parent.as_posix()
+
+
+class WorkspaceExplorerSelect(discord.ui.Select):
+    def __init__(self, view: WorkspaceExplorerView) -> None:
+        super().__init__(
+            placeholder="選擇檔案或資料夾",
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label="(目前沒有項目)", value="__none__")],
+            disabled=True,
+        )
+        self.row = 0
+        self.explorer = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        value = self.values[0]
+        self.explorer.selected_path = None if value == "__none__" else value
+        self.explorer.sync_components()
+        await interaction.response.edit_message(content=self.explorer.render_message(), view=self.explorer)
+
+    def sync_from_view(self) -> None:
+        if not self.explorer.entries:
+            self.disabled = True
+            self.placeholder = "目前資料夾是空的"
+            self.options = [discord.SelectOption(label="(目前沒有項目)", value="__none__")]
+            return
+        self.disabled = False
+        current_name = "根目錄" if self.explorer.current_path == "." else self.explorer.current_path
+        self.placeholder = f"目前位置：{current_name}"
+        options: list[discord.SelectOption] = []
+        for entry in self.explorer.entries[:25]:
+            label_name = PurePosixPath(entry.path).name or entry.path
+            prefix = "[DIR]" if entry.kind == "folder" else "[FILE]"
+            label = f"{prefix} {label_name}"
+            if len(label) > 100:
+                label = label[:97] + "..."
+            description = entry.path
+            if entry.kind == "file":
+                description = f"{entry.path} | {entry.size} bytes"
+            if len(description) > 100:
+                description = description[:97] + "..."
+            options.append(discord.SelectOption(label=label, value=entry.path, description=description))
+        self.options = options
+
+
+class WorkspaceExplorerView(discord.ui.View):
+    def __init__(self, bot: AgentCordBot, user: discord.abc.User, *, start_path: str = ".") -> None:
+        super().__init__(timeout=_WORKSPACE_EXPLORER_TIMEOUT_SECONDS)
+        self.bot = bot
+        self.user = user
+        self.message: discord.Message | None = None
+        self.notice = ""
+        self.entries: list[WorkspaceEntry] = []
+        self.current_path = "."
+        self.selected_path: str | None = None
+        self._entry_select = WorkspaceExplorerSelect(self)
+        self._open_button = discord.ui.Button(label="開啟", style=discord.ButtonStyle.primary)
+        self._open_button.row = 1
+        self._open_button.callback = self._on_open
+        self._up_button = discord.ui.Button(label="上一層", style=discord.ButtonStyle.secondary)
+        self._up_button.row = 1
+        self._up_button.callback = self._on_up
+        self._refresh_button = discord.ui.Button(label="重新整理", style=discord.ButtonStyle.secondary)
+        self._refresh_button.row = 1
+        self._refresh_button.callback = self._on_refresh
+        self._delete_button = discord.ui.Button(label="刪除選取", style=discord.ButtonStyle.danger)
+        self._delete_button.row = 1
+        self._delete_button.callback = self._on_delete
+        self._file_button = discord.ui.Button(label="新增/覆寫檔案", style=discord.ButtonStyle.success)
+        self._file_button.row = 2
+        self._file_button.callback = self._on_file_modal
+        self._folder_button = discord.ui.Button(label="新增資料夾", style=discord.ButtonStyle.success)
+        self._folder_button.row = 2
+        self._folder_button.callback = self._on_folder_modal
+        self.add_item(self._entry_select)
+        self.add_item(self._open_button)
+        self.add_item(self._up_button)
+        self.add_item(self._refresh_button)
+        self.add_item(self._delete_button)
+        self.add_item(self._file_button)
+        self.add_item(self._folder_button)
+
+        normalized_start = _join_workspace_path(".", start_path)
+        initial_entries = self.bot.workspace.list_files(self.user.id, normalized_start)
+        preferred_selected: str | None = None
+        if len(initial_entries) == 1 and initial_entries[0].path == normalized_start and initial_entries[0].kind == "file":
+            preferred_selected = normalized_start
+            self.current_path = _parent_workspace_path(normalized_start)
+        else:
+            self.current_path = normalized_start
+        self.reload_entries(preferred_selected=preferred_selected)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user.id:
+            return True
+        await interaction.response.send_message("只有原本的使用者可以操作這個檔案總管。", ephemeral=True)
+        return False
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except Exception:
+            return
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[object]) -> None:
+        label = getattr(item, "label", None) or getattr(item, "placeholder", None) or type(item).__name__
+        await self.bot.log_exception(
+            "檔案總管操作失敗",
+            error,
+            user=interaction.user,
+            guild=interaction.guild,
+            details=f"Explorer action: {label}\nPath: {self.current_path}",
+        )
+        await self.bot.send_interaction_message(interaction, f"檔案總管操作失敗：{error}", ephemeral=True)
+
+    def selected_entry(self) -> WorkspaceEntry | None:
+        if self.selected_path is None:
+            return None
+        for entry in self.entries:
+            if entry.path == self.selected_path:
+                return entry
+        return None
+
+    def relative_path_from_current(self, path: str) -> str:
+        current = PurePosixPath(self.current_path)
+        target = PurePosixPath(path)
+        if self.current_path == ".":
+            return target.as_posix()
+        try:
+            return target.relative_to(current).as_posix()
+        except ValueError:
+            return target.as_posix()
+
+    def sync_components(self) -> None:
+        self._entry_select.sync_from_view()
+        selected_entry = self.selected_entry()
+        self._open_button.disabled = selected_entry is None
+        self._delete_button.disabled = selected_entry is None
+        self._up_button.disabled = self.current_path == "."
+        if selected_entry is None:
+            self._open_button.label = "開啟"
+        elif selected_entry.kind == "folder":
+            self._open_button.label = "進入資料夾"
+        else:
+            self._open_button.label = "預覽檔案"
+
+    def reload_entries(self, *, preferred_selected: str | None = None) -> None:
+        self.entries = self.bot.workspace.list_files(self.user.id, self.current_path)
+        valid_paths = {entry.path for entry in self.entries}
+        candidate = preferred_selected if preferred_selected is not None else self.selected_path
+        self.selected_path = candidate if candidate in valid_paths else None
+        self.sync_components()
+
+    def render_message(self) -> str:
+        total_size = self.bot.workspace.total_size(self.user.id)
+        lines = [
+            "檔案總管",
+            f"目前路徑：{self.current_path}",
+            f"工作區用量：{total_size}/{self.bot.settings.workspace_limit_bytes} 位元組",
+            "操作方式：先用下拉清單選取，再用按鈕進行進入、預覽、建立、刪除或重新整理。",
+        ]
+        if self.notice:
+            lines.append(f"提示：{self.notice}")
+        selected_entry = self.selected_entry()
+        if selected_entry is not None:
+            kind_label = "資料夾" if selected_entry.kind == "folder" else "檔案"
+            lines.append(f"已選取：{kind_label} {selected_entry.path}")
+        lines.append("")
+        lines.append("清單：")
+        if not self.entries:
+            lines.append("(空白)")
+        else:
+            for index, entry in enumerate(self.entries[:15], start=1):
+                marker = ">" if entry.path == self.selected_path else " "
+                kind = "DIR" if entry.kind == "folder" else f"FILE {entry.size}"
+                name = PurePosixPath(entry.path).name or entry.path
+                lines.append(f"{marker} {index:>2}. [{kind}] {name}")
+            if len(self.entries) > 15:
+                lines.append(f"... 尚有 {len(self.entries) - 15} 個項目未顯示")
+        message = "\n".join(lines)
+        if len(message) <= 1900:
+            return message
+        return message[:1897] + "..."
+
+    def open_selected(self) -> WorkspaceEntry:
+        entry = self.selected_entry()
+        if entry is None:
+            raise WorkspaceError("請先選擇檔案或資料夾。")
+        if entry.kind == "folder":
+            self.current_path = entry.path
+            self.selected_path = None
+            self.notice = f"已進入 {entry.path}。"
+            self.reload_entries()
+        return entry
+
+    def go_up(self) -> str:
+        if self.current_path == ".":
+            raise WorkspaceError("目前已在根目錄。")
+        self.current_path = _parent_workspace_path(self.current_path)
+        self.selected_path = None
+        self.notice = f"已回到 {self.current_path}。"
+        self.reload_entries()
+        return self.current_path
+
+    def refresh(self) -> None:
+        self.notice = "已重新整理。"
+        self.reload_entries(preferred_selected=self.selected_path)
+
+    def create_folder(self, raw_path: str) -> str:
+        target_path = _join_workspace_path(self.current_path, raw_path)
+        created_path = self.bot.workspace.create_folder(self.user.id, target_path)
+        self.current_path = _parent_workspace_path(created_path)
+        self.notice = f"已建立資料夾 {created_path}。"
+        self.reload_entries(preferred_selected=created_path)
+        return created_path
+
+    def write_file(self, raw_path: str, content: str) -> str:
+        target_path = _join_workspace_path(self.current_path, raw_path)
+        self.bot.workspace.write_file(self.user.id, target_path, content)
+        self.current_path = _parent_workspace_path(target_path)
+        self.notice = f"已寫入檔案 {target_path}。"
+        self.reload_entries(preferred_selected=target_path)
+        return target_path
+
+    def delete_selected(self) -> str:
+        entry = self.selected_entry()
+        if entry is None:
+            raise WorkspaceError("請先選擇要刪除的項目。")
+        removed_path = entry.path
+        if entry.kind == "folder":
+            removed_path = self.bot.workspace.remove_folder(self.user.id, entry.path, force=False)
+            self.notice = f"已刪除資料夾 {removed_path}。"
+        else:
+            self.bot.workspace.delete_file(self.user.id, entry.path)
+            self.notice = f"已刪除檔案 {removed_path}。"
+        self.selected_path = None
+        self.reload_entries()
+        return removed_path
+
+    def preview_selected_file(self) -> tuple[str, discord.File | None]:
+        entry = self.selected_entry()
+        if entry is None or entry.kind != "file":
+            raise WorkspaceError("請先選擇檔案。")
+        content = self.bot.workspace.read_file(self.user.id, entry.path)
+        if len(content) <= 1800:
+            safe_content = content.replace("```", "'''")
+            return (f"{entry.path}\n```text\n{safe_content}\n```", None)
+        file = discord.File(io.BytesIO(content.encode("utf-8")), filename=Path(entry.path).name or "file.txt")
+        return (f"已附加 {entry.path}。", file)
+
+    async def _on_open(self, interaction: discord.Interaction) -> None:
+        try:
+            entry = self.open_selected()
+        except WorkspaceError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        if entry.kind == "folder":
+            await interaction.response.edit_message(content=self.render_message(), view=self)
+            return
+        message, file = self.preview_selected_file()
+        await self.bot.send_interaction_message(interaction, message, ephemeral=True, file=file)
+
+    async def _on_up(self, interaction: discord.Interaction) -> None:
+        try:
+            self.go_up()
+        except WorkspaceError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.edit_message(content=self.render_message(), view=self)
+
+    async def _on_refresh(self, interaction: discord.Interaction) -> None:
+        self.refresh()
+        await interaction.response.edit_message(content=self.render_message(), view=self)
+
+    async def _on_delete(self, interaction: discord.Interaction) -> None:
+        try:
+            self.delete_selected()
+        except WorkspaceError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.edit_message(content=self.render_message(), view=self)
+
+    async def _on_file_modal(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(WorkspaceFileModal(self))
+
+    async def _on_folder_modal(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(WorkspaceFolderModal(self))
+
+
+class WorkspaceFolderModal(discord.ui.Modal):
+    def __init__(self, explorer: WorkspaceExplorerView) -> None:
+        super().__init__(title="建立資料夾")
+        self.explorer = explorer
+        self.path_input = discord.ui.TextInput(
+            label="資料夾路徑",
+            placeholder="例如 logs 或 src/components",
+            max_length=300,
+        )
+        self.add_item(self.path_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            self.explorer.create_folder(str(self.path_input.value or ""))
+        except WorkspaceError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.edit_message(content=self.explorer.render_message(), view=self.explorer)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await self.explorer.bot.send_interaction_message(interaction, f"建立資料夾失敗：{error}", ephemeral=True)
+
+
+class WorkspaceFileModal(discord.ui.Modal):
+    def __init__(self, explorer: WorkspaceExplorerView) -> None:
+        super().__init__(title="新增或覆寫檔案")
+        self.explorer = explorer
+        selected_entry = explorer.selected_entry()
+        default_path = ""
+        default_content = ""
+        if selected_entry is not None and selected_entry.kind == "file":
+            default_path = explorer.relative_path_from_current(selected_entry.path)
+            try:
+                current_content = explorer.bot.workspace.read_file(explorer.user.id, selected_entry.path)
+            except WorkspaceError:
+                current_content = ""
+            if len(current_content) <= 4000:
+                default_content = current_content
+        self.path_input = discord.ui.TextInput(
+            label="檔案路徑",
+            placeholder="例如 app.py 或 src/app.py",
+            default=default_path,
+            max_length=300,
+        )
+        self.content_input = discord.ui.TextInput(
+            label="檔案內容",
+            placeholder="輸入 UTF-8 文字內容；留空可建立空白檔。",
+            default=default_content,
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=4000,
+        )
+        self.add_item(self.path_input)
+        self.add_item(self.content_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            self.explorer.write_file(str(self.path_input.value or ""), str(self.content_input.value or ""))
+        except WorkspaceError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.edit_message(content=self.explorer.render_message(), view=self.explorer)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await self.explorer.bot.send_interaction_message(interaction, f"寫入檔案失敗：{error}", ephemeral=True)
 
 
 def register_commands(bot: AgentCordBot) -> None:
@@ -731,6 +1143,18 @@ def register_commands(bot: AgentCordBot) -> None:
 
     file_manager = app_commands.Group(name="file-manager", description="瀏覽並編輯你的工作區檔案。")
 
+    @file_manager.command(name="explorer", description="用互動式清單與按鈕瀏覽工作區。")
+    @app_commands.describe(path="起始路徑，預設為工作區根目錄。")
+    async def file_explorer(interaction: discord.Interaction, path: str = ".") -> None:
+        view = WorkspaceExplorerView(bot, interaction.user, start_path=path)
+        await log_interaction(
+            interaction,
+            "開啟工作區檔案總管。",
+            fields=[("路徑", view.current_path, True)],
+        )
+        await interaction.response.send_message(view.render_message(), ephemeral=True, view=view)
+        view.message = await interaction.original_response()
+
     @file_manager.command(name="list", description="列出資料夾中的檔案。")
     @app_commands.describe(path="工作區內的資料夾路徑。")
     async def file_list(interaction: discord.Interaction, path: str = ".") -> None:
@@ -913,6 +1337,7 @@ def register_commands(bot: AgentCordBot) -> None:
     @set_model.error
     @set_pterodactyl.error
     @custom_model.error
+    @file_explorer.error
     @file_list.error
     @file_read.error
     @file_write.error

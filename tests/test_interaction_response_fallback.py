@@ -20,15 +20,16 @@ class _FakeResponse:
         self._done = done
         self._error = error
         self.messages: list[tuple[str | None, bool]] = []
+        self.kwargs_history: list[dict[str, object]] = []
 
     def is_done(self) -> bool:
         return self._done
 
     async def send_message(self, message: str | None = None, *, ephemeral: bool = False, **kwargs) -> None:
-        del kwargs
         if self._error is not None:
             raise self._error
         self.messages.append((message, ephemeral))
+        self.kwargs_history.append(dict(kwargs))
         self._done = True
 
 
@@ -36,12 +37,13 @@ class _FakeFollowup:
     def __init__(self, error: Exception | None = None) -> None:
         self._error = error
         self.messages: list[tuple[str | None, bool]] = []
+        self.kwargs_history: list[dict[str, object]] = []
 
     async def send(self, message: str | None = None, *, ephemeral: bool = False, **kwargs) -> None:
-        del kwargs
         if self._error is not None:
             raise self._error
         self.messages.append((message, ephemeral))
+        self.kwargs_history.append(dict(kwargs))
 
 
 class _FakeUser:
@@ -123,6 +125,13 @@ class InteractionResponseFallbackTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.send_interaction_message(interaction, "secret", ephemeral=True)
 
         self.assertEqual(interaction.channel.messages, ["@user 互動已逾時，改以私訊傳送。\nsecret"])
+
+    async def test_followup_omits_view_kwarg_when_none(self) -> None:
+        interaction = _FakeInteraction(response_done=True, error=None)
+
+        await self.bot.send_interaction_message(interaction, "hello", ephemeral=True)
+
+        self.assertEqual(interaction.followup.kwargs_history, [{}])
 
 
 if __name__ == "__main__":
