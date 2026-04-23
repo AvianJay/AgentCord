@@ -172,10 +172,7 @@ class AgentConversationSession:
             return
         message = f"互動處理失敗：{error}"
         try:
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
+            await self.bot.send_interaction_message(interaction, message, ephemeral=True)
         except Exception:  # noqa: BLE001
             return
 

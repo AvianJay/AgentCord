@@ -166,6 +166,96 @@ class AgentCordBot(commands.Bot):
             fields=fields,
         )
 
+    def _is_expired_interaction_error(self, error: BaseException) -> bool:
+        status = getattr(error, "status", None)
+        code = getattr(error, "code", None)
+        if code in {10015, 10062, 50027}:
+            return True
+        if status in {401, 404}:
+            message = str(error).lower()
+            return any(token in message for token in ("webhook", "interaction", "token"))
+        return False
+
+    def _reset_interaction_file(self, file: discord.File | None) -> None:
+        if file is None:
+            return
+        fp = getattr(file, "fp", None)
+        if fp is not None and hasattr(fp, "seek"):
+            fp.seek(0)
+
+    async def _send_interaction_fallback(
+        self,
+        interaction: discord.Interaction,
+        message: str | None,
+        *,
+        ephemeral: bool,
+        file: discord.File | None = None,
+        view: discord.ui.View | None = None,
+        error: BaseException,
+    ) -> None:
+        note = "互動已逾時，改以私訊傳送。" if ephemeral else "互動已逾時，改以一般訊息傳送。"
+        try:
+            await self.log_exception(
+                "Interaction Token 過期",
+                error,
+                user=interaction.user,
+                guild=interaction.guild,
+                details=f"Command: {interaction.command.qualified_name if interaction.command else 'interaction'}",
+            )
+        except Exception:
+            pass
+
+        content = (message or "").strip()
+        if ephemeral:
+            dm_content = note if not content else f"{note}\n{content}"
+            try:
+                self._reset_interaction_file(file)
+                await interaction.user.send(dm_content, file=file, view=view)
+                return
+            except Exception:
+                pass
+
+        channel = interaction.channel
+        if channel is not None:
+            channel_content = content
+            if ephemeral:
+                channel_content = f"{interaction.user.mention} {note}"
+                if content:
+                    channel_content = f"{channel_content}\n{content}"
+            self._reset_interaction_file(file)
+            await channel.send(channel_content or note, file=file, view=None if ephemeral else view)
+            return
+
+        self._reset_interaction_file(file)
+        await interaction.user.send(content or note, file=file, view=view)
+
+    async def send_interaction_message(
+        self,
+        interaction: discord.Interaction,
+        message: str | None = None,
+        *,
+        ephemeral: bool = False,
+        file: discord.File | None = None,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=ephemeral, file=file, view=view)
+            else:
+                await interaction.response.send_message(message, ephemeral=ephemeral, file=file, view=view)
+            return
+        except Exception as exc:
+            if not self._is_expired_interaction_error(exc):
+                raise
+            await self._send_interaction_fallback(
+                interaction,
+                message,
+                ephemeral=ephemeral,
+                file=file,
+                view=view,
+                error=exc,
+            )
+
 
 def register_commands(bot: AgentCordBot) -> None:
     def preview_text(text: str, limit: int = 300) -> str:
@@ -189,6 +279,15 @@ def register_commands(bot: AgentCordBot) -> None:
             f"本次使用自訂模型，不扣額度。 (輸入={input_tokens}，輸出={output_tokens}，單價={model_rate:.3f})",
             f"目前額度：{remaining:.2f}",
         ]
+
+    async def send_interaction_chunks(
+        interaction: discord.Interaction,
+        text: str,
+        *,
+        ephemeral: bool = False,
+    ) -> None:
+        for chunk in chunk_text(text):
+            await bot.send_interaction_message(interaction, chunk, ephemeral=ephemeral)
 
     async def log_interaction(
         interaction: discord.Interaction,
@@ -312,11 +411,7 @@ def register_commands(bot: AgentCordBot) -> None:
         )
         usage_lines = format_usage_summary(config, response.usage, remaining)
         reply = f"{response.content}\n\n" + "\n".join(usage_lines)
-        for index, chunk in enumerate(chunk_text(reply)):
-            if index == 0:
-                await interaction.followup.send(chunk, ephemeral=True)
-            else:
-                await interaction.followup.send(chunk, ephemeral=True)
+        await send_interaction_chunks(interaction, reply, ephemeral=True)
 
     @bot.tree.command(name="agent", description="執行多步驟程式代理。")
     @app_commands.describe(prompt="描述要讓代理建立或修改的內容。")
@@ -359,11 +454,7 @@ def register_commands(bot: AgentCordBot) -> None:
                 ]
             )
         message = "\n".join(lines)
-        for index, chunk in enumerate(chunk_text(message)):
-            if index == 0:
-                await interaction.followup.send(chunk)
-            else:
-                await interaction.followup.send(chunk)
+        await send_interaction_chunks(interaction, message)
 
     @bot.tree.command(name="call-ai-codeing", description="叫 AI 寫程式。")
     @app_commands.describe(prompt="描述要讓代理建立或修改的內容。")
@@ -395,11 +486,7 @@ def register_commands(bot: AgentCordBot) -> None:
             )
         lines.append("使用 /agent-open 並帶入 task_id 可重新打開對話。")
         message = "\n".join(lines)
-        for index, chunk in enumerate(chunk_text(message)):
-            if index == 0:
-                await interaction.response.send_message(chunk)
-            else:
-                await interaction.followup.send(chunk)
+        await send_interaction_chunks(interaction, message)
 
     @bot.tree.command(name="agent-open", description="重新打開既有的 agent 對話。")
     @app_commands.describe(task_id="要重新打開的對話編號。", prompt="可選：重新打開後立刻送出的新訊息。")
@@ -493,7 +580,8 @@ def register_commands(bot: AgentCordBot) -> None:
                 ("帳號", account_label, False),
             ],
         )
-        await interaction.followup.send(
+        await bot.send_interaction_message(
+            interaction,
             f"Pterodactyl Client API 已設定完成。驗證帳號：{account_label}\nAPI URL：{config.base_url}",
             ephemeral=True,
         )
@@ -756,7 +844,7 @@ def register_commands(bot: AgentCordBot) -> None:
             "匯出工作區 zip。",
             fields=[("檔案", export_path.name, True)],
         )
-        await interaction.followup.send("工作區匯出已準備完成。", file=file, ephemeral=True)
+        await bot.send_interaction_message(interaction, "工作區匯出已準備完成。", file=file, ephemeral=True)
 
     @bot.tree.command(name="import-zip", description="從 zip 壓縮檔匯入工作區。")
     @app_commands.describe(archive="要匯入到工作區根目錄的 zip 壓縮檔。")
@@ -779,7 +867,8 @@ def register_commands(bot: AgentCordBot) -> None:
                 ("預覽", preview_text(preview_paths or "(空白)", 900), False),
             ],
         )
-        await interaction.followup.send(
+        await bot.send_interaction_message(
+            interaction,
             f"已匯入 {len(imported_paths)} 個檔案。工作區用量：{total_size}/{bot.settings.workspace_limit_bytes} 位元組。",
             ephemeral=True,
         )
@@ -841,10 +930,7 @@ def register_commands(bot: AgentCordBot) -> None:
             if isinstance(original, aiohttp.ClientError):
                 message = f"網路請求失敗：{message or type(original).__name__}"
             use_ephemeral = not is_public_agent_command(interaction)
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=use_ephemeral)
-            else:
-                await interaction.response.send_message(message, ephemeral=use_ephemeral)
+            await bot.send_interaction_message(interaction, message, ephemeral=use_ephemeral)
             return
         raise error
 

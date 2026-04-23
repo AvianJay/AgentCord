@@ -20,6 +20,7 @@ class _FakeBot:
         self.fail_log_event = fail_log_event
         self.logged_events: list[tuple[str, str]] = []
         self.logged_exceptions: list[tuple[str, str]] = []
+        self.interaction_messages: list[tuple[str, bool]] = []
 
     async def log_event(self, title: str, description: str, **kwargs) -> None:
         del kwargs
@@ -30,6 +31,10 @@ class _FakeBot:
     async def log_exception(self, title: str, error: BaseException, **kwargs) -> None:
         del kwargs
         self.logged_exceptions.append((title, str(error)))
+
+    async def send_interaction_message(self, interaction, message: str | None = None, *, ephemeral: bool = False, **kwargs) -> None:
+        del interaction, kwargs
+        self.interaction_messages.append((message or "", ephemeral))
 
 
 class _RecordingSession(AgentConversationSession):
@@ -81,6 +86,15 @@ class LiveAgentResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(title, "Agent Tool")
         self.assertIn("Tool: read_file", description)
         self.assertIn('src/app.ts', description)
+
+    async def test_interaction_exception_uses_bot_fallback_sender(self) -> None:
+        bot = _FakeBot()
+        session = _RecordingSession(bot)
+        interaction = SimpleNamespace(response=SimpleNamespace(is_done=lambda: True))
+
+        await session.handle_interaction_exception("AgentConversationView", RuntimeError("boom"), interaction)
+
+        self.assertEqual(bot.interaction_messages, [("互動處理失敗：boom", True)])
 
 
 if __name__ == "__main__":
