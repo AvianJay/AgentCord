@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 from agentcord.live_agent import AgentConversationSession
@@ -35,6 +36,29 @@ class _FakeBot:
     async def send_interaction_message(self, interaction, message: str | None = None, *, ephemeral: bool = False, **kwargs) -> None:
         del interaction, kwargs
         self.interaction_messages.append((message or "", ephemeral))
+
+
+class _FakeChannelMessage:
+    def __init__(self, message_id: int, channel) -> None:
+        self.id = message_id
+        self.channel = channel
+
+    async def edit(self, *, content=None, view=None) -> None:
+        del content, view
+
+
+class _FakeInteractionMessage(_FakeChannelMessage):
+    pass
+
+
+class _FakeChannel:
+    def __init__(self, fetched_message: _FakeChannelMessage) -> None:
+        self.fetched_message = fetched_message
+        self.fetch_calls: list[int] = []
+
+    async def fetch_message(self, message_id: int) -> _FakeChannelMessage:
+        self.fetch_calls.append(message_id)
+        return self.fetched_message
 
 
 class _RecordingSession(AgentConversationSession):
@@ -95,6 +119,37 @@ class LiveAgentResilienceTests(unittest.IsolatedAsyncioTestCase):
         await session.handle_interaction_exception("AgentConversationView", RuntimeError("boom"), interaction)
 
         self.assertEqual(bot.interaction_messages, [("互動處理失敗：boom", True)])
+
+    async def test_open_rehydrates_original_response_to_normal_message(self) -> None:
+        bot = _FakeBot()
+        session = _RecordingSession(bot)
+        channel_message = _FakeChannelMessage(42, None)
+        channel = _FakeChannel(channel_message)
+        channel_message.channel = channel
+        interaction_message = _FakeInteractionMessage(42, channel)
+        response = SimpleNamespace(send_message=self._async_noop)
+        interaction = SimpleNamespace(
+            guild=None,
+            response=response,
+            original_response=self._async_return(interaction_message),
+        )
+
+        with mock.patch("agentcord.live_agent.discord.InteractionMessage", _FakeInteractionMessage):
+            await session.open(interaction)
+
+        self.assertIs(session.message, channel_message)
+        self.assertEqual(channel.fetch_calls, [42])
+
+    @staticmethod
+    async def _async_noop(*args, **kwargs) -> None:
+        del args, kwargs
+
+    @staticmethod
+    def _async_return(value):
+        async def _inner():
+            return value
+
+        return _inner
 
 
 if __name__ == "__main__":

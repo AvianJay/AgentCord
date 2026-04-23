@@ -185,7 +185,18 @@ class AgentConversationSession:
                 self._append_activity(f"已恢復 {len(self._pending_file_changes)} 個待確認變更。")
         self.view.sync_layout()
         await interaction.response.send_message(view=self.view)
-        self.message = await interaction.original_response()
+        self.message = await self._resolve_editable_message(await interaction.original_response())
+
+    async def _resolve_editable_message(self, message: discord.Message) -> discord.Message:
+        if not isinstance(message, discord.InteractionMessage):
+            return message
+        channel = getattr(message, "channel", None)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return message
+        try:
+            return await channel.fetch_message(message.id)
+        except discord.HTTPException:
+            return message
 
     async def close(self, reason: str | None = None) -> None:
         self._closed = True
@@ -331,6 +342,7 @@ class AgentConversationSession:
             return
         async with self._render_lock:
             try:
+                self.message = await self._resolve_editable_message(self.message)
                 self.view.sync_layout()
                 await self.message.edit(content=None, view=self.view)
             except discord.HTTPException as exc:
