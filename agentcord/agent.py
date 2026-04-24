@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from agentcord.ai import PollinationsProvider, create_provider, format_exception_message, parse_json_object, resolve_model_info
+from agentcord.ai import ModelJSONParseError, PollinationsProvider, create_provider, format_exception_message, parse_json_object, resolve_model_info
 from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.models import AIUsage, AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
@@ -244,7 +244,18 @@ class CodingAgent:
                         "phase": f"iteration-{iteration}",
                     },
                 )
-                decision = parse_json_object(step_response.content)
+                decision, repaired_model = await self._parse_model_json_response(
+                    user_id,
+                    provider,
+                    config,
+                    step_response.content,
+                    schema_hint=_DECISION_JSON_SCHEMA_HINT,
+                    purpose=f"第 {iteration} 輪決策輸出",
+                    progress_callback=progress_callback,
+                    activity_key=f"decision:{iteration}",
+                )
+                if repaired_model:
+                    actual_model = repaired_model
                 await self._remove_activity(progress_callback, activity_key=f"decision:{iteration}")
                 tool_results, touched_files, current_task_items = await self._execute_actions(
                     user_id,
@@ -423,7 +434,18 @@ class CodingAgent:
                 "phase": "planning",
             },
         )
-        data = parse_json_object(response.content)
+        data, repaired_model = await self._parse_model_json_response(
+            user_id,
+            provider,
+            config,
+            response.content,
+            schema_hint=_PLAN_JSON_SCHEMA_HINT,
+            purpose="計畫輸出",
+            progress_callback=progress_callback,
+            activity_key="plan",
+        )
+        if repaired_model:
+            resolved_model = repaired_model
         plan = [str(item) for item in data.get("plan", []) if str(item).strip()]
         await self._emit_activity(
             progress_callback,
@@ -882,6 +904,48 @@ class CodingAgent:
                 for item in current_task_items
             ],
         }
+
+    async def _parse_model_json_response(
+        self,
+        user_id: int,
+        provider: Any,
+        config: UserModelConfig,
+        raw_content: str,
+        *,
+        schema_hint: str,
+        purpose: str,
+        progress_callback: ProgressCallback | None = None,
+        activity_key: str | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        try:
+            return parse_json_object(raw_content), None
+        except ModelJSONParseError as exc:
+            await self._emit_activity(
+                progress_callback,
+                f"{purpose} 不是合法 JSON，正在要求模型重新整理格式。",
+                activity_key=activity_key,
+            )
+            repair_prompt = (
+                "你上一則回覆不是合法 JSON。"
+                "請根據原始回覆內容，改寫成單一合法 JSON 物件。"
+                "只能輸出 JSON，不要輸出 Markdown、解釋、前言或後記。\n\n"
+                f"必須符合的 JSON 結構：\n{schema_hint}\n\n"
+                f"原始回覆：\n{raw_content.strip() or '(空白輸出)'}"
+            )
+            self.credits.ensure_affordable(user_id, config, repair_prompt)
+            repair_response = await provider.generate(
+                [
+                    {"role": "system", "content": _JSON_REPAIR_SYSTEM_PROMPT},
+                    {"role": "user", "content": repair_prompt},
+                ]
+            )
+            self.credits.charge(user_id, config, repair_response.usage.cost)
+            try:
+                return parse_json_object(repair_response.content), repair_response.model or None
+            except ModelJSONParseError as repair_exc:
+                raise ModelJSONParseError(
+                    f"原始輸出：{exc.output_preview} | 修正輸出：{repair_exc.output_preview}"
+                ) from repair_exc
 
     def _build_agent_system_prompt(self) -> str:
         tool_schema = json.dumps(self._build_ai_tools(), ensure_ascii=False, indent=2)
@@ -2345,7 +2409,14 @@ class CodingAgent:
                 {"role": "user", "content": query},
             ]
         )
-        data = parse_json_object(response.content)
+        data, _ = await self._parse_model_json_response(
+            user_id,
+            provider,
+            config,
+            response.content,
+            schema_hint=_SEARCH_RESULTS_JSON_SCHEMA_HINT,
+            purpose="搜尋結果輸出",
+        )
         urls = [item["url"] for item in data.get("results", []) if isinstance(item, dict) and item.get("url")]
         self.db.remember_search_urls(user_id, urls)
         return data
@@ -2371,6 +2442,41 @@ _PLANNING_SYSTEM_PROMPT = """
 你是 Discord bot 工作區的 AI 程式規劃器。
 只回傳合法 JSON。
 plan 內容請使用繁體中文。
+"""
+
+
+_JSON_REPAIR_SYSTEM_PROMPT = """
+你是 JSON 修復器。
+你會收到一段不是合法 JSON 的模型回覆，以及目標 JSON 結構說明。
+請只輸出一個合法 JSON 物件，不要輸出 Markdown、註解、前言或解釋。
+若原始回覆缺少某些欄位，就依照結構補上最保守且合理的值。
+"""
+
+
+_DECISION_JSON_SCHEMA_HINT = """
+最上層必須是 JSON object，且至少包含：
+- summary: string
+- done: boolean
+- related_files: string[]
+- actions: object[]
+actions 內每一項都必須是單一工具呼叫物件，欄位需符合對應工具 schema。
+"""
+
+
+_PLAN_JSON_SCHEMA_HINT = """
+最上層必須是 JSON object，且包含：
+- plan: string[]
+plan 內容必須是繁體中文短句列表。
+"""
+
+
+_SEARCH_RESULTS_JSON_SCHEMA_HINT = """
+最上層必須是 JSON object，且包含：
+- results: object[]
+results 內每一項都必須包含：
+- title: string
+- url: string
+- summary: string
 """
 
 

@@ -14,18 +14,29 @@ from agentcord.workspace import WorkspaceManager
 
 
 class _FakeProvider:
-    def __init__(self, decisions: list[dict[str, object]]) -> None:
+    def __init__(self, decisions: list[object], *, repair_responses: list[object] | None = None) -> None:
         self.decisions = list(decisions)
+        self.repair_responses = list(repair_responses or [])
         self.contexts: list[str] = []
+        self.generate_messages: list[list[dict[str, str]]] = []
 
     async def stream_generate(self, messages, on_delta=None):
         del on_delta
         self.contexts.append(str(messages[1]["content"]))
         decision = self.decisions.pop(0)
         return AIResponse(
-            content=json.dumps(decision, ensure_ascii=False),
+            content=decision if isinstance(decision, str) else json.dumps(decision, ensure_ascii=False),
             usage=AIUsage(input_tokens=10, output_tokens=10, cost=0.0, model_rate=0.0),
             model="fake-model",
+        )
+
+    async def generate(self, messages):
+        self.generate_messages.append(messages)
+        response = self.repair_responses.pop(0)
+        return AIResponse(
+            content=response if isinstance(response, str) else json.dumps(response, ensure_ascii=False),
+            usage=AIUsage(input_tokens=10, output_tokens=10, cost=0.0, model_rate=0.0),
+            model="fake-model-repair",
         )
 
 
@@ -94,6 +105,32 @@ class AgentRunBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tool_results", tool_messages[0].content)
         self.assertEqual(result.summary, "先建立進度")
         self.assertTrue(all(item.status == "done" for item in result.task_items))
+
+    async def test_run_repairs_non_json_model_output_once(self) -> None:
+        provider = _FakeProvider(
+            ["看起來目前工具暫時無法使用。讓我再試一次讀取現有程式碼，才能規劃要加的功能。"],
+            repair_responses=[
+                {
+                    "summary": "先重新讀取現有程式碼。",
+                    "done": True,
+                    "related_files": [],
+                    "actions": [],
+                }
+            ],
+        )
+
+        with (
+            mock.patch("agentcord.agent.create_provider", return_value=provider),
+            mock.patch(
+                "agentcord.agent.resolve_model_info",
+                new=mock.AsyncMock(return_value=ProviderModelInfo(name="fake-model", context_length=32000)),
+            ),
+        ):
+            result = await self.agent.run(123, "請繼續完成整個任務")
+
+        self.assertEqual(result.summary, "先重新讀取現有程式碼。")
+        self.assertEqual(len(provider.generate_messages), 1)
+        self.assertIn("不是合法 JSON", provider.generate_messages[0][1]["content"])
 
 
 if __name__ == "__main__":
