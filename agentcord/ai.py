@@ -37,8 +37,11 @@ _SENSITIVE_QUERY_KEYS = {"key", "api_key", "apikey", "token", "access_token", "a
 
 class ModelJSONParseError(ValueError):
     def __init__(self, output_preview: str = "") -> None:
+        self.output_preview = sanitize_sensitive_text(output_preview.strip()) or "(空白輸出)"
         super().__init__("模型輸出不包含合法 JSON 物件。")
-        self.output_preview = output_preview
+
+    def __str__(self) -> str:
+        return f"{super().__str__()} 輸出預覽：{self.output_preview}"
 
 
 def _resolve_response_model(payload: Any) -> str | None:

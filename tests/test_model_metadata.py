@@ -283,11 +283,19 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ai.ModelJSONParseError) as context:
             ai.parse_json_object("```text\nnot json yet\nline two\n```")
 
-        self.assertEqual(str(context.exception), "模型輸出不包含合法 JSON 物件。")
+        self.assertIn("模型輸出不包含合法 JSON 物件。", str(context.exception))
+        self.assertIn("輸出預覽：", str(context.exception))
         self.assertIn("not json yet", context.exception.output_preview)
         formatted = ai.format_exception_message(context.exception)
         self.assertIn("輸出預覽：", formatted)
         self.assertIn("not json yet", formatted)
+
+    def test_parse_json_object_empty_output_uses_explicit_placeholder(self) -> None:
+        with self.assertRaises(ai.ModelJSONParseError) as context:
+            ai.parse_json_object("   \n\t  ")
+
+        self.assertEqual(context.exception.output_preview, "(空白輸出)")
+        self.assertIn("(空白輸出)", str(context.exception))
 
     def test_format_exception_message_redacts_google_api_key_in_url(self) -> None:
         error = RuntimeError(
