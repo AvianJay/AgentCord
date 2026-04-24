@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from agentcord.ai import PollinationsProvider, create_provider, parse_json_object, resolve_model_info
+from agentcord.ai import PollinationsProvider, create_provider, format_exception_message, parse_json_object, resolve_model_info
 from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.models import AIUsage, AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
@@ -1048,16 +1048,17 @@ class CodingAgent:
                     preview=self._preview_tool_result_payload(result_payload),
                 )
             except (WorkspaceError, KeyError, ValueError, aiohttp.ClientError) as exc:
-                results.append({"tool": tool_name, "error": str(exc)})
+                safe_error = format_exception_message(exc)
+                results.append({"tool": tool_name, "error": safe_error})
                 await self._emit_tool_result_preview(
                     progress_callback,
                     tool_name,
                     status="error",
-                    preview=str(exc),
+                    preview=safe_error,
                 )
                 await self._emit_activity(
                     progress_callback,
-                    f"{self._format_tool_label(tool_name)}失敗：{exc}",
+                    f"{self._format_tool_label(tool_name)}失敗：{safe_error}",
                     activity_key=activity_key,
                 )
                 continue

@@ -9,6 +9,8 @@ from typing import Iterable, Sequence
 import aiohttp
 import discord
 
+from agentcord.ai import format_exception_message, sanitize_sensitive_text
+
 DISCORD_LOG_BATCH_DELAY = 1.0
 DISCORD_LOG_BATCH_SIZE = 10
 _EMBED_DESCRIPTION_LIMIT = 4000
@@ -70,11 +72,11 @@ class DiscordWebhookLogger:
         details: str = "",
         fields: Sequence[tuple[str, str, bool]] | None = None,
     ) -> None:
-        trace = "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
+        trace = sanitize_sensitive_text("".join(traceback.format_exception(type(error), error, error.__traceback__)).strip())
         description_parts = []
         if details.strip():
-            description_parts.append(details.strip())
-        description_parts.append(f"{type(error).__name__}: {error}")
+            description_parts.append(sanitize_sensitive_text(details.strip()))
+        description_parts.append(f"{type(error).__name__}: {format_exception_message(error)}")
         description_parts.append(trace)
         await self.log(
             title,

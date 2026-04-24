@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 
+from agentcord.ai import format_exception_message
 from agentcord.models import AgentTaskItem, ConversationMessage, TaskRecord, TaskStatus
 from agentcord.workspace import WorkspaceError
 
@@ -174,7 +175,7 @@ class AgentConversationSession:
         )
         if interaction is None:
             return
-        message = f"互動處理失敗：{error}"
+        message = f"互動處理失敗：{format_exception_message(error)}"
         try:
             await self.bot.send_interaction_message(interaction, message, ephemeral=True)
         except Exception:  # noqa: BLE001
@@ -497,12 +498,13 @@ class AgentConversationSession:
                     color=discord.Colour.orange(),
                 )
             except Exception as exc:  # noqa: BLE001
+                safe_error = format_exception_message(exc)
                 self.task_record = self.bot.db.get_task_by_id(self.task_record.id)
                 self.task_record = self.bot.db.update_task(
                     self.task_record.id,
                     TaskStatus.FAILED,
                     self.task_record.related_files,
-                    summary=f"執行失敗：{exc}",
+                    summary=f"執行失敗：{safe_error}",
                     plan=self.task_record.plan,
                     validations=self.task_record.validations,
                     messages=self._build_persisted_messages(),
@@ -511,7 +513,7 @@ class AgentConversationSession:
                     context_length=self.context_state.context_length,
                     compression_count=self.context_state.compression_count,
                 )
-                self._append_activity(f"本輪執行失敗：{exc}")
+                self._append_activity(f"本輪執行失敗：{safe_error}")
                 await self.bot.log_exception(
                     "Agent 執行失敗",
                     exc,

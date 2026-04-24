@@ -6,6 +6,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlunsplit
 from typing import Any, Awaitable, Callable
 
 import aiohttp
@@ -26,6 +27,18 @@ _THINKING_TAG_RE = re.compile(r"<(?P<tag>think|thinking)>[\s\S]*?</(?P=tag)>", r
 _THINKING_FENCE_RE = re.compile(r"```(?:think|thinking|reasoning|thoughts?)\s*[\s\S]*?```", re.IGNORECASE)
 _THINKING_LABEL_RE = re.compile(r"^\s*(?:thinking|reasoning|thought\s*process)\s*(?::|：|\.\.\.)", re.IGNORECASE)
 _THINKING_LINE_RE = re.compile(r"^\s*(?:thinking|reasoning|thought\s*process)\s*(?::|：|\.\.\.)?\s*$", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s,;]+)")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|apikey|access[_-]?token|token|authorization)\b(\s*[=:]\s*|%3[Dd])([^&\s,'\"}]+)"
+)
+_SENSITIVE_QUERY_KEYS = {"key", "api_key", "apikey", "token", "access_token", "authorization", "auth"}
+
+
+class ModelJSONParseError(ValueError):
+    def __init__(self, output_preview: str = "") -> None:
+        super().__init__("模型輸出不包含合法 JSON 物件。")
+        self.output_preview = output_preview
 
 
 def _resolve_response_model(payload: Any) -> str | None:
@@ -58,6 +71,49 @@ def sanitize_ai_response_content(text: str) -> str:
         cleaned = paragraphs[1].strip()
 
     return cleaned or text.strip()
+
+
+def sanitize_sensitive_text(text: str) -> str:
+    if not text:
+        return text
+
+    def _sanitize_url_match(match: re.Match[str]) -> str:
+        url = match.group(0)
+        try:
+            parsed = urlsplit(url)
+        except Exception:
+            return url
+        if not parsed.query:
+            return url
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        sanitized_pairs = [
+            (key, "***" if key.lower() in _SENSITIVE_QUERY_KEYS else value)
+            for key, value in pairs
+        ]
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(sanitized_pairs, doseq=True), parsed.fragment))
+
+    redacted = _URL_RE.sub(_sanitize_url_match, text)
+    redacted = _BEARER_TOKEN_RE.sub(r"\1***", redacted)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}***", redacted)
+    return redacted
+
+
+def build_model_output_preview(text: str, *, limit: int = 280) -> str:
+    cleaned = sanitize_sensitive_text(sanitize_ai_response_content(text).strip() or text.strip())
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
+
+
+def format_exception_message(error: BaseException) -> str:
+    base_message = sanitize_sensitive_text(str(error).strip()) or type(error).__name__
+    preview = sanitize_sensitive_text(str(getattr(error, "output_preview", "")).strip())
+    if preview and "輸出預覽：" not in base_message:
+        return f"{base_message} 輸出預覽：{preview}"
+    return base_message
 
 
 def _request_timeout() -> aiohttp.ClientTimeout:
@@ -886,7 +942,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
         search_start = start + 1
-    raise ValueError("模型輸出不包含合法 JSON 物件。")
+    raise ModelJSONParseError(build_model_output_preview(cleaned or text))
 
 
 async def fetch_pollinations_models(

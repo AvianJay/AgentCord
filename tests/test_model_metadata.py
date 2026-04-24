@@ -279,6 +279,26 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload, {"plan": ["a"]})
 
+    def test_parse_json_object_invalid_json_exposes_preview_on_error(self) -> None:
+        with self.assertRaises(ai.ModelJSONParseError) as context:
+            ai.parse_json_object("```text\nnot json yet\nline two\n```")
+
+        self.assertEqual(str(context.exception), "模型輸出不包含合法 JSON 物件。")
+        self.assertIn("not json yet", context.exception.output_preview)
+        formatted = ai.format_exception_message(context.exception)
+        self.assertIn("輸出預覽：", formatted)
+        self.assertIn("not json yet", formatted)
+
+    def test_format_exception_message_redacts_google_api_key_in_url(self) -> None:
+        error = RuntimeError(
+            "402, message='Payment Required', url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaSecretKey123'"
+        )
+
+        message = ai.format_exception_message(error)
+
+        self.assertIn("key=%2A%2A%2A", message)
+        self.assertNotIn("AIzaSecretKey123", message)
+
 
 class AgentModelMetadataTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

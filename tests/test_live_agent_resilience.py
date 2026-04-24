@@ -167,6 +167,21 @@ class LiveAgentResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(bot.interaction_messages, [("互動處理失敗：boom", True)])
 
+    async def test_interaction_exception_redacts_sensitive_url_in_message(self) -> None:
+        bot = _FakeBot()
+        session = _RecordingSession(bot)
+        interaction = SimpleNamespace(response=SimpleNamespace(is_done=lambda: True))
+        error = RuntimeError(
+            "402, message='Payment Required', url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaSecretKey123'"
+        )
+
+        await session.handle_interaction_exception("AgentConversationView", error, interaction)
+
+        sent_message, is_ephemeral = bot.interaction_messages[0]
+        self.assertTrue(is_ephemeral)
+        self.assertIn("key=%2A%2A%2A", sent_message)
+        self.assertNotIn("AIzaSecretKey123", sent_message)
+
     async def test_open_rehydrates_original_response_to_normal_message(self) -> None:
         bot = _FakeBot()
         session = _RecordingSession(bot)

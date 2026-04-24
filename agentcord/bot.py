@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from agentcord.agent import CodingAgent, CreditManager
-from agentcord.ai import create_provider, fetch_pollinations_models, fetch_provider_models, resolve_pollinations_model, resolve_provider_model
+from agentcord.ai import create_provider, fetch_pollinations_models, fetch_provider_models, format_exception_message, resolve_pollinations_model, resolve_provider_model
 from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.logger import DiscordWebhookLogger
@@ -1349,7 +1349,7 @@ def register_commands(bot: AgentCordBot) -> None:
     @import_zip.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         original = getattr(error, "original", error)
-        message = str(original)
+        message = format_exception_message(original if isinstance(original, BaseException) else Exception(str(original)))
         await log_command_error(interaction, original if isinstance(original, BaseException) else Exception(message))
         if isinstance(original, (WorkspaceError, ValueError, aiohttp.ClientError)):
             if isinstance(original, aiohttp.ClientError):
