@@ -16,6 +16,9 @@ DEFAULT_MODEL_RATES: dict[str, float] = {
     "anthropic:*": 0.08,
     "google:*": 0.06,
     "xai:*": 0.07,
+    "openrouter:*": 0.05,
+    "deepseek:*": 0.05,
+    "nvidia_nim:*": 0.05,
     "custom:*": 0.1,
 }
 

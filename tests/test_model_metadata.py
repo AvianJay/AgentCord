@@ -107,6 +107,71 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models[0].context_length, 128000)
         self.assertEqual(models[1].context_length, 1047576)
 
+    async def test_fetch_openrouter_models_uses_openai_compatible_catalog(self) -> None:
+        session = _FakeSession(
+            {
+                "https://openrouter.ai/api/v1/models": [
+                    {
+                        "data": [
+                            {
+                                "id": "openai/gpt-4.1-mini",
+                                "name": "GPT-4.1 Mini",
+                                "description": "OpenRouter normalized catalog entry",
+                                "context_length": 1047576,
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+        settings = _make_settings(Path(tempfile.gettempdir()))
+
+        models = await ai.fetch_provider_models(
+            session,
+            settings,
+            Provider.OPENROUTER,
+            "openrouter-key",
+            force_refresh=True,
+        )
+
+        self.assertEqual([model.name for model in models], ["openai/gpt-4.1-mini"])
+        self.assertEqual(models[0].description, "OpenRouter normalized catalog entry")
+        self.assertEqual(models[0].context_length, 1047576)
+
+    async def test_fetch_deepseek_models_uses_openai_compatible_catalog(self) -> None:
+        session = _FakeSession(
+            {
+                "https://api.deepseek.com/models": [
+                    {
+                        "data": [
+                            {
+                                "id": "deepseek-v4-flash",
+                                "description": "DeepSeek V4 Flash",
+                                "context_length": 65536,
+                            },
+                            {
+                                "id": "deepseek-v4-pro",
+                                "owned_by": "deepseek",
+                            },
+                        ]
+                    }
+                ]
+            }
+        )
+        settings = _make_settings(Path(tempfile.gettempdir()))
+
+        models = await ai.fetch_provider_models(
+            session,
+            settings,
+            Provider.DEEPSEEK,
+            "deepseek-key",
+            force_refresh=True,
+        )
+
+        self.assertEqual([model.name for model in models], ["deepseek-v4-flash", "deepseek-v4-pro"])
+        self.assertEqual(models[0].context_length, 65536)
+        self.assertEqual(models[1].description, "deepseek")
+
     async def test_fetch_google_models_normalizes_name_and_filters_generation_models(self) -> None:
         session = _FakeSession(
             {
@@ -229,6 +294,27 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(provider, ai.OpenAICompatibleProvider)
         self.assertEqual(provider.base_url, "https://api.poe.com/v1")
+
+    def test_create_provider_supports_new_openai_compatible_endpoints(self) -> None:
+        settings = _make_settings(Path(tempfile.gettempdir()))
+        cases = [
+            (Provider.OPENROUTER, "openrouter-key", "openai/gpt-4.1-mini", "https://openrouter.ai/api/v1"),
+            (Provider.DEEPSEEK, "deepseek-key", "deepseek-v4-flash", "https://api.deepseek.com"),
+            (Provider.NVIDIA_NIM, "nim-key", "meta/llama-3.1-70b-instruct", "https://integrate.api.nvidia.com/v1"),
+        ]
+
+        for provider_value, api_key, model, expected_base_url in cases:
+            with self.subTest(provider=provider_value.value):
+                provider = ai.create_provider(
+                    object(),
+                    settings,
+                    UserModelConfig(provider=provider_value, api_key=api_key, model=model),
+                )
+
+                self.assertIsInstance(provider, ai.OpenAICompatibleProvider)
+                self.assertEqual(provider.base_url, expected_base_url)
+                self.assertEqual(provider.request_api_key, api_key)
+                self.assertFalse(provider.require_proxy)
 
     def test_create_provider_supports_custom_combined_apiurl_and_api_key(self) -> None:
         settings = _make_settings(Path(tempfile.gettempdir()))

@@ -22,7 +22,15 @@ _provider_models_cache: dict[
     tuple[str, str, str],
     tuple[float, list[ProviderModelInfo], dict[str, ProviderModelInfo]],
 ] = {}
-_OPENAI_COMPATIBLE_PROVIDERS = {Provider.OPENAI, Provider.XAI, Provider.POE, Provider.CUSTOM}
+_OPENAI_COMPATIBLE_BASE_URLS = {
+    Provider.OPENAI: "https://api.openai.com/v1",
+    Provider.XAI: "https://api.x.ai/v1",
+    Provider.POE: "https://api.poe.com/v1",
+    Provider.OPENROUTER: "https://openrouter.ai/api/v1",
+    Provider.DEEPSEEK: "https://api.deepseek.com",
+    Provider.NVIDIA_NIM: "https://integrate.api.nvidia.com/v1",
+}
+_OPENAI_COMPATIBLE_PROVIDERS = set(_OPENAI_COMPATIBLE_BASE_URLS) | {Provider.CUSTOM}
 _THINKING_TAG_RE = re.compile(r"<(?P<tag>think|thinking)>[\s\S]*?</(?P=tag)>", re.IGNORECASE)
 _THINKING_FENCE_RE = re.compile(r"```(?:think|thinking|reasoning|thoughts?)\s*[\s\S]*?```", re.IGNORECASE)
 _THINKING_LABEL_RE = re.compile(r"^\s*(?:thinking|reasoning|thought\s*process)\s*(?::|：|\.\.\.)", re.IGNORECASE)
@@ -244,12 +252,9 @@ def _resolve_openai_compatible_endpoint(
     api_key: str,
 ) -> tuple[str, str, bool]:
     raw_api_key = api_key.strip()
-    if provider is Provider.OPENAI:
-        return "https://api.openai.com/v1", raw_api_key, False
-    if provider is Provider.XAI:
-        return "https://api.x.ai/v1", raw_api_key, False
-    if provider is Provider.POE:
-        return "https://api.poe.com/v1", raw_api_key, False
+    base_url = _OPENAI_COMPATIBLE_BASE_URLS.get(provider)
+    if base_url is not None:
+        return base_url, raw_api_key, False
     if provider is Provider.CUSTOM:
         base_url, resolved_api_key = _resolve_custom_provider_credentials(settings, raw_api_key)
         return base_url, resolved_api_key, True
@@ -896,21 +901,19 @@ def create_provider(
 ) -> AIProvider:
     if config.provider is Provider.POLLINATIONS:
         return PollinationsProvider(session, settings, config)
-    if config.provider is Provider.OPENAI:
-        return OpenAICompatibleProvider(session, settings, config, "https://api.openai.com/v1")
-    if config.provider is Provider.XAI:
-        return OpenAICompatibleProvider(session, settings, config, "https://api.x.ai/v1")
-    if config.provider is Provider.POE:
-        return OpenAICompatibleProvider(session, settings, config, "https://api.poe.com/v1")
-    if config.provider is Provider.CUSTOM:
-        base_url, resolved_api_key = _resolve_custom_provider_credentials(settings, config.api_key)
+    if config.provider in _OPENAI_COMPATIBLE_PROVIDERS:
+        base_url, resolved_api_key, require_proxy = _resolve_openai_compatible_endpoint(
+            settings,
+            config.provider,
+            config.api_key,
+        )
         return OpenAICompatibleProvider(
             session,
             settings,
             config,
             base_url,
             api_key=resolved_api_key,
-            require_proxy=True,
+            require_proxy=require_proxy,
         )
     if config.provider is Provider.ANTHROPIC:
         return AnthropicProvider(session, settings, config)

@@ -12,6 +12,9 @@ class Provider(StrEnum):
     GOOGLE = "google"
     XAI = "xai"
     POE = "poe"
+    OPENROUTER = "openrouter"
+    DEEPSEEK = "deepseek"
+    NVIDIA_NIM = "nvidia_nim"
     CUSTOM = "custom"
 
 
