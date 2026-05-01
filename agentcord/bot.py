@@ -1041,6 +1041,7 @@ def register_commands(bot: AgentCordBot) -> None:
             app_commands.Choice(name="OpenRouter", value=Provider.OPENROUTER.value),
             app_commands.Choice(name="DeepSeek", value=Provider.DEEPSEEK.value),
             app_commands.Choice(name="NVIDIA NIM", value=Provider.NVIDIA_NIM.value),
+            app_commands.Choice(name="L. AI", value=Provider.LAI.value),
             app_commands.Choice(name="自訂 OpenAI 相容", value=Provider.CUSTOM.value),
         ]
     )

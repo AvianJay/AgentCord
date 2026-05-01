@@ -301,6 +301,7 @@ class ProviderModelMetadataTests(unittest.IsolatedAsyncioTestCase):
             (Provider.OPENROUTER, "openrouter-key", "openai/gpt-4.1-mini", "https://openrouter.ai/api/v1"),
             (Provider.DEEPSEEK, "deepseek-key", "deepseek-v4-flash", "https://api.deepseek.com"),
             (Provider.NVIDIA_NIM, "nim-key", "meta/llama-3.1-70b-instruct", "https://integrate.api.nvidia.com/v1"),
+            (Provider.LAI, "lai-key", "GPT-5", "https://aiapi114514.zynuke.lol/v1"),
         ]
 
         for provider_value, api_key, model, expected_base_url in cases:

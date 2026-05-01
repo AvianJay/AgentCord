@@ -29,6 +29,7 @@ _OPENAI_COMPATIBLE_BASE_URLS = {
     Provider.OPENROUTER: "https://openrouter.ai/api/v1",
     Provider.DEEPSEEK: "https://api.deepseek.com",
     Provider.NVIDIA_NIM: "https://integrate.api.nvidia.com/v1",
+    Provider.LAI: "https://aiapi114514.zynuke.lol/v1",
 }
 _OPENAI_COMPATIBLE_PROVIDERS = set(_OPENAI_COMPATIBLE_BASE_URLS) | {Provider.CUSTOM}
 _THINKING_TAG_RE = re.compile(r"<(?P<tag>think|thinking)>[\s\S]*?</(?P=tag)>", re.IGNORECASE)

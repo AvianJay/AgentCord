@@ -15,6 +15,7 @@ class Provider(StrEnum):
     OPENROUTER = "openrouter"
     DEEPSEEK = "deepseek"
     NVIDIA_NIM = "nvidia_nim"
+    LAI = "lai"
     CUSTOM = "custom"
 
 

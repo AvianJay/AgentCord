@@ -546,16 +546,60 @@ class WorkspaceManager:
     def export_zip(self, user_id: int, target: Path) -> Path:
         root = self.user_root(user_id)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for file_path in root.rglob("*"):
-                if file_path.is_file():
-                    archive.write(file_path, arcname=file_path.relative_to(root))
+        # 蒐集要打包的檔案，先排序確保 zip 內容穩定可重現，並一律使用 posix 風格
+        # 路徑作為 arcname；否則在 Windows 上 zipfile 會寫入 `a\b\c.txt` 這種反斜線
+        # 路徑，導致解壓端（Linux/macOS）看到單一壞檔名而非巢狀資料夾。
+        entries: list[tuple[str, Path]] = []
+        for file_path in sorted(root.rglob("*")):
+            if not file_path.is_file():
+                continue
+            try:
+                relative = file_path.relative_to(root)
+            except ValueError:
+                continue
+            relative_posix = relative.as_posix()
+            if self._is_internal_review_path(relative_posix):
+                continue
+            entries.append((relative_posix, file_path))
+
+        # 寫入暫存檔再 rename，避免中途失敗留下半成品 zip。
+        tmp_target = target.with_suffix(target.suffix + ".tmp")
+        if tmp_target.exists():
+            tmp_target.unlink()
+        try:
+            with zipfile.ZipFile(
+                tmp_target,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+                allowZip64=True,
+            ) as archive:
+                for arcname, file_path in entries:
+                    archive.write(file_path, arcname=arcname)
+        except Exception:
+            if tmp_target.exists():
+                try:
+                    tmp_target.unlink()
+                except OSError:
+                    pass
+            raise
+        if target.exists():
+            target.unlink()
+        tmp_target.replace(target)
         return target
 
     def import_zip(self, user_id: int, archive_bytes: bytes) -> list[str]:
+        if not archive_bytes:
+            raise WorkspaceError("上傳的檔案是空的。")
         try:
             archive_buffer = io.BytesIO(archive_bytes)
             with zipfile.ZipFile(archive_buffer) as archive:
+                bad_member = archive.testzip()
+                if bad_member is not None:
+                    raise WorkspaceError(
+                        f"Zip 壓縮檔內含損毀的檔案：{bad_member}（CRC 不符）。"
+                    )
+
                 file_members = [member for member in archive.infolist() if not member.is_dir()]
                 if not file_members:
                     raise WorkspaceError("Zip 壓縮檔中沒有可匯入的檔案。")
@@ -563,13 +607,27 @@ class WorkspaceManager:
                 normalized_members: list[tuple[str, zipfile.ZipInfo]] = []
                 seen_paths: set[str] = set()
                 total_size = 0
+                skipped_junk = 0
                 for member in file_members:
-                    normalized_path = self._normalize_relative_path(member.filename)
+                    raw_name = member.filename or ""
+                    if self._is_zip_junk_path(raw_name):
+                        skipped_junk += 1
+                        continue
+                    try:
+                        normalized_path = self._normalize_relative_path(raw_name)
+                    except WorkspaceError as exc:
+                        raise WorkspaceError(
+                            f"Zip 壓縮檔包含不允許的路徑：{raw_name}"
+                        ) from exc
                     if normalized_path == ".":
                         continue
                     if normalized_path in seen_paths:
                         raise WorkspaceError(f"Zip 壓縮檔包含重複路徑：{normalized_path}")
                     seen_paths.add(normalized_path)
+                    if member.file_size < 0:
+                        raise WorkspaceError(
+                            f"Zip 條目大小不合法：{normalized_path}"
+                        )
                     total_size += member.file_size
                     normalized_members.append((normalized_path, member))
 
@@ -587,21 +645,55 @@ class WorkspaceManager:
                         f"匯入遭拒：工作區將超過 {self._limit_bytes} 位元組上限。"
                     )
 
-                imported_paths: list[str] = []
+                # 先把所有檔案讀進記憶體並完成 UTF-8 驗證，全部都通過才開始寫入磁碟，
+                # 避免一檔失敗後留下半套寫入的工作區。
+                staged: list[tuple[str, bytes]] = []
                 for normalized_path, member in normalized_members:
-                    absolute = self._resolve_path(user_id, normalized_path)
-                    absolute.parent.mkdir(parents=True, exist_ok=True)
-                    extracted = archive.read(member)
+                    try:
+                        extracted = archive.read(member)
+                    except (zipfile.BadZipFile, RuntimeError) as exc:
+                        raise WorkspaceError(
+                            f"無法讀取 zip 條目 {normalized_path}：{exc}"
+                        ) from exc
+                    if len(extracted) != member.file_size and member.file_size > 0:
+                        # zipfile 已驗 CRC，這通常代表 header 與內容不一致。
+                        raise WorkspaceError(
+                            f"Zip 條目大小不一致：{normalized_path}"
+                        )
                     try:
                         text_content = extracted.decode("utf-8")
                     except UnicodeDecodeError as exc:
-                        raise WorkspaceError(f"只允許匯入 UTF-8 文字檔：{normalized_path}") from exc
+                        raise WorkspaceError(
+                            f"只允許匯入 UTF-8 文字檔：{normalized_path}"
+                        ) from exc
                     self._assert_text(text_content)
-                    absolute.write_bytes(extracted)
+                    staged.append((normalized_path, extracted))
+
+                imported_paths: list[str] = []
+                for normalized_path, payload in staged:
+                    absolute = self._resolve_path(user_id, normalized_path)
+                    absolute.parent.mkdir(parents=True, exist_ok=True)
+                    absolute.write_bytes(payload)
                     imported_paths.append(normalized_path)
                 return imported_paths
         except zipfile.BadZipFile as exc:
             raise WorkspaceError("上傳的檔案不是有效的 zip 壓縮檔。") from exc
+
+    @staticmethod
+    def _is_zip_junk_path(raw_name: str) -> bool:
+        cleaned = raw_name.strip().replace("\\", "/")
+        if not cleaned:
+            return True
+        # 一律忽略 macOS Finder 與其他打包器產生的 metadata。
+        first_part = cleaned.split("/", 1)[0]
+        if first_part in {"__MACOSX", ".DS_Store"}:
+            return True
+        basename = cleaned.rsplit("/", 1)[-1]
+        if basename in {".DS_Store", "Thumbs.db", "desktop.ini"}:
+            return True
+        if basename.startswith("._"):  # AppleDouble metadata
+            return True
+        return False
 
     def py_compile_check(self, user_id: int, path: str) -> str:
         absolute = self._resolve_path(user_id, path)
