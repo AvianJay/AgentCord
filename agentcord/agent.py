@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import inspect
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -81,6 +82,48 @@ class AgentToolSpec:
                 "parameters": self.parameters,
             },
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolPresentation:
+    """工具在進度列上的呈現方式：emoji、動作名稱、要顯示的目標欄位。"""
+
+    emoji: str
+    label: str
+    arg_keys: tuple[str, ...] = ()
+    default_target: str = ""
+
+
+# 表驅動的工具呈現設定；sync_workspace 與 request 因為標題會隨參數變化而另行特判。
+_TOOL_PRESENTATIONS: dict[str, _ToolPresentation] = {
+    "list_files": _ToolPresentation("📂", "列出路徑", ("path",), default_target="."),
+    "read_file": _ToolPresentation("📖", "讀取檔案", ("path",)),
+    "grep_search": _ToolPresentation("🔍", "搜尋內容", ("query",)),
+    "write_file": _ToolPresentation("✏️", "寫入檔案", ("path",)),
+    "apply_patch": _ToolPresentation("🩹", "套用 patch"),
+    "delete_file": _ToolPresentation("🗑️", "刪除檔案", ("path",)),
+    "restore_file": _ToolPresentation("↩️", "還原檔案", ("path",)),
+    "create_folder": _ToolPresentation("📁", "建立資料夾", ("path",)),
+    "remove_folder": _ToolPresentation("🗑️", "刪除資料夾", ("path",)),
+    "py_compile_check": _ToolPresentation("✅", "語法檢查", ("path",)),
+    "search_web": _ToolPresentation("🌐", "搜尋網路", ("query",)),
+    "fetch_url": _ToolPresentation("🔗", "抓取網址", ("url",)),
+    "send_message": _ToolPresentation("💬", "發送訊息"),
+    "ask_user_choice": _ToolPresentation("❓", "詢問使用者"),
+    "sleep": _ToolPresentation("⏳", "等待", ("seconds",)),
+    "pterodactyl_list_servers": _ToolPresentation("🖥️", "列出伺服器"),
+    "pterodactyl_read_startup": _ToolPresentation("⚙️", "讀取 startup", ("server",)),
+    "pterodactyl_set_startup_variable": _ToolPresentation("⚙️", "更新 startup 變數", ("server", "key")),
+    "pterodactyl_power_action": _ToolPresentation("🔌", "伺服器電源操作", ("server", "signal")),
+    "pterodactyl_send_command": _ToolPresentation("⌨️", "送出 console 指令", ("server",)),
+    "pterodactyl_read_console": _ToolPresentation("📜", "讀取 console", ("server",)),
+    "pterodactyl_read_server_file": _ToolPresentation("📖", "讀取伺服器檔案", ("server", "path")),
+    "pterodactyl_write_server_file": _ToolPresentation("✏️", "寫入伺服器檔案", ("server", "path")),
+    "tasks": _ToolPresentation("📋", "更新 tasks 清單"),
+}
+
+# 在 streaming 的局部 JSON / tool-call 參數中嘗試擷取的目標欄位。
+_STREAM_TARGET_KEYS = ("path", "query", "url", "server", "key", "signal", "command", "remote_path", "method")
 
 
 class CreditManager:
@@ -939,6 +982,11 @@ class CodingAgent:
         progress_callback: ProgressCallback | None,
     ) -> tuple[dict[str, Any], str | None]:
         activity_key = f"decision:{iteration}"
+        on_delta, on_tool_call = self._build_decision_stream_callbacks(
+            iteration,
+            progress_callback,
+            activity_key=activity_key,
+        )
         step_response = await provider.stream_generate(
             [
                 {"role": "system", "content": self._build_agent_system_prompt(native_tools=True)},
@@ -946,11 +994,8 @@ class CodingAgent:
             ],
             tools=self._build_ai_tools(),
             tool_choice="auto",
-            on_delta=self._build_stream_progress_callback(
-                f"第 {iteration} 輪決策生成中",
-                progress_callback,
-                activity_key=activity_key,
-            ),
+            on_delta=on_delta,
+            on_tool_call=on_tool_call,
         )
         self.credits.charge(user_id, config, step_response.usage.cost)
         actions = self._normalize_actions(step_response.tool_calls)
@@ -973,16 +1018,17 @@ class CodingAgent:
         progress_callback: ProgressCallback | None,
     ) -> tuple[dict[str, Any], str | None]:
         activity_key = f"decision:{iteration}"
+        on_delta, _ = self._build_decision_stream_callbacks(
+            iteration,
+            progress_callback,
+            activity_key=activity_key,
+        )
         step_response = await provider.stream_generate(
             [
                 {"role": "system", "content": self._build_agent_system_prompt(native_tools=False)},
                 {"role": "user", "content": context},
             ],
-            on_delta=self._build_stream_progress_callback(
-                f"第 {iteration} 輪決策生成中",
-                progress_callback,
-                activity_key=activity_key,
-            ),
+            on_delta=on_delta,
         )
         self.credits.charge(user_id, config, step_response.usage.cost)
         actual_model = step_response.model or None
@@ -2338,11 +2384,53 @@ class CodingAgent:
             next_emit_threshold += 240
             await self._emit_activity(
                 progress_callback,
-                f"{message_prefix}（已接收約 {received_chars} 字元）",
+                f"📝 {message_prefix}…（已接收約 {received_chars} 字元）",
                 activity_key=activity_key,
             )
 
         return on_delta
+
+    def _build_decision_stream_callbacks(
+        self,
+        iteration: int,
+        progress_callback: ProgressCallback | None,
+        *,
+        activity_key: str,
+    ) -> tuple[
+        Callable[[str], Awaitable[None] | None] | None,
+        Callable[[list[dict[str, Any]]], Awaitable[None] | None] | None,
+    ]:
+        """產生 streaming callback，把模型逐步輸出轉成「準備寫入檔案…」之類的具象進度。"""
+        if progress_callback is None:
+            return None, None
+
+        thinking_message = f"🧠 第 {iteration} 輪決策生成中…"
+        state = {"text": "", "text_scanned": 0, "tool_scanned": 0, "last": None}
+
+        async def emit(message: str) -> None:
+            if message == state["last"]:
+                return
+            state["last"] = message
+            await self._emit_activity(progress_callback, message, activity_key=activity_key)
+
+        async def on_delta(delta: str) -> None:
+            state["text"] += delta
+            # 節流並只掃描尾段，避免 write_file 內容很大時造成 O(n^2) 掃描。
+            if state["last"] is not None and len(state["text"]) - state["text_scanned"] < 60:
+                return
+            state["text_scanned"] = len(state["text"])
+            intent = self._streaming_intent_from_text(state["text"][-4000:])
+            await emit(intent or thinking_message)
+
+        async def on_tool_call(partial_calls: list[dict[str, Any]]) -> None:
+            total = sum(len(str(call.get("arguments") or "")) for call in partial_calls)
+            if state["last"] is not None and total - state["tool_scanned"] < 60:
+                return
+            state["tool_scanned"] = total
+            intent = self._streaming_intent_from_tool_calls(partial_calls)
+            await emit(intent or thinking_message)
+
+        return on_delta, on_tool_call
 
     def _render_conversation_history(self, messages: list[ConversationMessage]) -> str:
         if not messages:
@@ -2372,129 +2460,87 @@ class CodingAgent:
             items.append(AgentTaskItem(title=title, status=status))
         return items
 
-    def _format_tool_label(self, tool_name: Any) -> str:
-        labels = {
-            "read_file": "讀取檔案",
-            "write_file": "寫入檔案",
-            "list_files": "列出路徑",
-            "delete_file": "刪除檔案",
-            "restore_file": "還原檔案",
-            "create_folder": "建立資料夾",
-            "remove_folder": "刪除資料夾",
-            "apply_patch": "套用 patch",
-            "py_compile_check": "語法檢查",
-            "search_web": "搜尋網路",
-            "fetch_url": "抓取網址",
-            "send_message": "發送訊息",
-            "ask_user_choice": "請使用者回覆",
-            "sleep": "等待",
-            "pterodactyl_read_startup": "讀取 startup",
-            "pterodactyl_set_startup_variable": "更新 startup 變數",
-            "pterodactyl_power_action": "伺服器電源操作",
-            "pterodactyl_send_command": "送出 console 指令",
-            "pterodactyl_read_console": "讀取 console",
-            "pterodactyl_read_server_file": "讀取伺服器檔案",
-            "pterodactyl_write_server_file": "寫入伺服器檔案",
-            "pterodactyl_sync_workspace": "同步工作區與伺服器",
-            "pterodactyl_request": "Pterodactyl API 請求",
-            "tasks": "更新 tasks 清單",
-        }
+    def _tool_presentation(self, tool_name: Any, action: dict[str, Any]) -> tuple[str, str, str]:
+        """回傳 (emoji, 動作名稱, 目標字串)，含 sync/request 的特例處理。"""
         normalized = self._normalize_tool_name(tool_name)
-        return labels.get(normalized, f"工具 {tool_name}")
+        if normalized == "pterodactyl_sync_workspace":
+            direction = str(action.get("direction") or "push").lower()
+            label = "同步伺服器到工作區" if direction == "pull" else "同步工作區到伺服器"
+            target = " ".join(
+                part
+                for part in (str(action.get("server") or "").strip(), str(action.get("remote_path") or "").strip())
+                if part
+            )
+            return "🔄", label, target
+        if normalized == "pterodactyl_request":
+            method = str(action.get("method") or "").strip().upper()
+            path = str(action.get("path") or "/").strip() or "/"
+            return "📡", "Pterodactyl API 請求", f"{method} {path}".strip()
+        presentation = _TOOL_PRESENTATIONS.get(normalized)
+        if presentation is None:
+            return "⚙️", f"執行 {normalized or '工具'}", ""
+        return presentation.emoji, presentation.label, self._format_tool_target(normalized, action)
+
+    def _format_tool_target(self, tool_name: str, action: dict[str, Any]) -> str:
+        presentation = _TOOL_PRESENTATIONS.get(tool_name)
+        if presentation is None:
+            return ""
+        parts: list[str] = []
+        for key in presentation.arg_keys:
+            value = action.get(key)
+            text = str(value).strip() if value is not None else ""
+            if text:
+                parts.append(text)
+        if not parts and presentation.default_target:
+            parts.append(presentation.default_target)
+        return " ".join(parts)
+
+    def _format_tool_label(self, tool_name: Any) -> str:
+        _, label, _ = self._tool_presentation(tool_name, {})
+        return label
 
     def _format_tool_start_message(self, tool_name: Any, action: dict[str, Any]) -> str:
-        tool_name = self._normalize_tool_name(tool_name)
-        if tool_name == "read_file":
-            return f"讀取檔案中：{action.get('path', '')}"
-        if tool_name == "write_file":
-            return f"寫入檔案中：{action.get('path', '')}"
-        if tool_name == "list_files":
-            return f"列出路徑中：{action.get('path', '.') }"
-        if tool_name == "delete_file":
-            return f"刪除檔案中：{action.get('path', '')}"
-        if tool_name == "restore_file":
-            return f"還原檔案中：{action.get('path', '')}"
-        if tool_name == "create_folder":
-            return f"建立資料夾中：{action.get('path', '')}"
-        if tool_name == "remove_folder":
-            return f"刪除資料夾中：{action.get('path', '')}"
-        if tool_name == "apply_patch":
-            return "套用 patch 中。"
-        if tool_name == "py_compile_check":
-            return f"語法檢查中：{action.get('path', '')}"
-        if tool_name == "search_web":
-            return f"搜尋網路中：{action.get('query', '')}"
-        if tool_name == "fetch_url":
-            return f"抓取網址中：{action.get('url', '')}"
-        if tool_name == "send_message":
-            return "發送訊息中。"
-        if tool_name == "ask_user_choice":
-            return "等待使用者回覆中。"
-        if tool_name == "sleep":
-            return f"等待中：{action.get('seconds', '')} 秒"
-        if tool_name == "pterodactyl_read_startup":
-            return f"讀取 startup 中：{action.get('server', '')}"
-        if tool_name == "pterodactyl_set_startup_variable":
-            return f"更新 startup 變數中：{action.get('server', '')} {action.get('key', '')}"
-        if tool_name == "pterodactyl_power_action":
-            return f"伺服器電源操作中：{action.get('server', '')} {action.get('signal', '')}"
-        if tool_name == "pterodactyl_send_command":
-            return f"送出 console 指令中：{action.get('server', '')}"
-        if tool_name == "pterodactyl_read_console":
-            return f"讀取 console 中：{action.get('server', '')}"
-        if tool_name == "pterodactyl_read_server_file":
-            return f"讀取伺服器檔案中：{action.get('server', '')} {action.get('path', '')}"
-        if tool_name == "pterodactyl_write_server_file":
-            return f"寫入伺服器檔案中：{action.get('server', '')} {action.get('path', '')}"
-        if tool_name == "pterodactyl_sync_workspace":
-            direction = str(action.get("direction") or "push").lower()
-            if direction == "pull":
-                return f"同步伺服器到工作區中：{action.get('server', '')} {action.get('remote_path', '/') }"
-            return f"同步工作區到伺服器中：{action.get('server', '')} {action.get('remote_path', '/') }"
-        if tool_name == "pterodactyl_request":
-            return f"Pterodactyl API 請求中：{str(action.get('method', '')).upper()} {action.get('path', '/') }"
-        if tool_name == "tasks":
-            return "更新 tasks 清單中。"
-        return f"執行工具中：{tool_name}"
+        emoji, label, target = self._tool_presentation(tool_name, action)
+        return f"{emoji} 正在{label}：{target}" if target else f"{emoji} 正在{label}。"
 
     def _format_tool_finish_message(self, tool_name: Any, action: dict[str, Any]) -> str:
-        tool_name = self._normalize_tool_name(tool_name)
-        if tool_name in {"read_file", "write_file", "delete_file", "restore_file", "create_folder", "remove_folder", "py_compile_check"}:
-            return f"{self._format_tool_label(tool_name)}已完成：{action.get('path', '')}"
-        if tool_name == "list_files":
-            return f"列出路徑已完成：{action.get('path', '.') }"
-        if tool_name == "search_web":
-            return "搜尋網路已完成。"
-        if tool_name == "fetch_url":
-            return "抓取網址已完成。"
-        if tool_name == "send_message":
-            return "訊息已發送。"
-        if tool_name == "ask_user_choice":
-            return "已收到使用者回覆。"
-        if tool_name == "sleep":
-            return "等待已完成。"
-        if tool_name in {
-            "pterodactyl_read_startup",
-            "pterodactyl_set_startup_variable",
-            "pterodactyl_power_action",
-            "pterodactyl_send_command",
-            "pterodactyl_read_console",
-            "pterodactyl_read_server_file",
-            "pterodactyl_write_server_file",
+        emoji, label, target = self._tool_presentation(tool_name, action)
+        return f"{emoji} {label}完成：{target}" if target else f"{emoji} {label}完成。"
+
+    def _format_tool_intent_message(self, tool_name: Any, action: dict[str, Any]) -> str:
+        emoji, label, target = self._tool_presentation(tool_name, action)
+        return f"{emoji} 準備{label}：{target}…" if target else f"{emoji} 準備{label}…"
+
+    def _extract_partial_args(self, text: str, keys: tuple[str, ...]) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for key in keys:
+            match = re.search(rf'"{key}"\s*:\s*"([^"\\]*)"', text)
+            if match:
+                found[key] = match.group(1)
+        return found
+
+    def _streaming_intent_from_text(self, text: str) -> str | None:
+        matches = list(re.finditer(r'"(?:tool|name)"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)"', text))
+        if not matches:
+            return None
+        last = matches[-1]
+        tool_name = self._normalize_tool_name(last.group(1))
+        if tool_name not in _TOOL_PRESENTATIONS and tool_name not in {
+            "pterodactyl_sync_workspace",
+            "pterodactyl_request",
         }:
-            return f"{self._format_tool_label(tool_name)}已完成：{action.get('server', '')}"
-        if tool_name == "pterodactyl_sync_workspace":
-            direction = str(action.get("direction") or "push").lower()
-            if direction == "pull":
-                return f"同步伺服器到工作區已完成：{action.get('server', '')}"
-            return f"同步工作區到伺服器已完成：{action.get('server', '')}"
-        if tool_name == "pterodactyl_request":
-            return f"Pterodactyl API 請求已完成：{str(action.get('method', '')).upper()} {action.get('path', '/') }"
-        if tool_name == "apply_patch":
-            return "套用 patch 已完成。"
-        if tool_name == "tasks":
-            return "tasks 清單已更新。"
-        return f"執行工具已完成：{tool_name}"
+            return None
+        args = self._extract_partial_args(text[last.end():], _STREAM_TARGET_KEYS)
+        return self._format_tool_intent_message(tool_name, args)
+
+    def _streaming_intent_from_tool_calls(self, partial_calls: list[dict[str, Any]]) -> str | None:
+        for call in reversed(partial_calls):
+            tool_name = self._normalize_tool_name(call.get("name"))
+            if not tool_name:
+                continue
+            args = self._extract_partial_args(str(call.get("arguments") or "")[:2000], _STREAM_TARGET_KEYS)
+            return self._format_tool_intent_message(tool_name, args)
+        return None
 
     async def _search_web(self, user_id: int, query: str) -> dict[str, Any]:
         config = UserModelConfig(

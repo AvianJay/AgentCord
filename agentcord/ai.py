@@ -5,8 +5,7 @@ import json
 import re
 import time
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
-from urllib.parse import parse_qsl, urlencode, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Any, Awaitable, Callable
 
 import aiohttp
@@ -600,8 +599,10 @@ class AIProvider(ABC):
         self,
         messages: list[dict[str, str]],
         on_delta: Callable[[str], Awaitable[None] | None] | None = None,
+        on_tool_call: Callable[[list[dict[str, Any]]], Awaitable[None] | None] | None = None,
         **kwargs: Any,
     ) -> AIResponse:
+        del on_tool_call  # 非串流供應商沒有逐步工具呼叫可回報。
         response = await self.generate(messages, **kwargs)
         if on_delta and response.content:
             maybe_result = on_delta(response.content)
@@ -627,6 +628,23 @@ def _apply_tool_payload(payload: dict[str, Any], kwargs: dict[str, Any]) -> None
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = kwargs.get("tool_choice", "auto")
+
+
+async def _emit_stream_tool_calls(
+    on_tool_call: Callable[[list[dict[str, Any]]], Awaitable[None] | None] | None,
+    buffer: dict[int, dict[str, Any]],
+) -> None:
+    if on_tool_call is None or not buffer:
+        return
+    partial = [
+        {"name": buffer[index].get("name", ""), "arguments": buffer[index].get("arguments", "")}
+        for index in sorted(buffer)
+    ]
+    if not any(call["name"] for call in partial):
+        return
+    maybe_result = on_tool_call(partial)
+    if maybe_result is not None:
+        await maybe_result
 
 
 class PollinationsProvider(AIProvider):
@@ -661,6 +679,7 @@ class PollinationsProvider(AIProvider):
         self,
         messages: list[dict[str, str]],
         on_delta: Callable[[str], Awaitable[None] | None] | None = None,
+        on_tool_call: Callable[[list[dict[str, Any]]], Awaitable[None] | None] | None = None,
         **kwargs: Any,
     ) -> AIResponse:
         headers = {"Content-Type": "application/json"}
@@ -711,6 +730,7 @@ class PollinationsProvider(AIProvider):
                     continue
                 response_model = _resolve_response_model(chunk) or response_model
                 _accumulate_stream_tool_calls(chunk, tool_call_buffer)
+                await _emit_stream_tool_calls(on_tool_call, tool_call_buffer)
                 delta = _extract_stream_text(chunk)
                 if not delta:
                     continue
@@ -786,6 +806,7 @@ class OpenAICompatibleProvider(AIProvider):
         self,
         messages: list[dict[str, str]],
         on_delta: Callable[[str], Awaitable[None] | None] | None = None,
+        on_tool_call: Callable[[list[dict[str, Any]]], Awaitable[None] | None] | None = None,
         **kwargs: Any,
     ) -> AIResponse:
         headers = {
@@ -839,6 +860,7 @@ class OpenAICompatibleProvider(AIProvider):
                         continue
                     response_model = _resolve_response_model(chunk) or response_model
                     _accumulate_stream_tool_calls(chunk, tool_call_buffer)
+                    await _emit_stream_tool_calls(on_tool_call, tool_call_buffer)
                     delta = _extract_stream_text(chunk)
                     if not delta:
                         continue
@@ -903,7 +925,8 @@ class GoogleProvider(AIProvider):
             for message in messages
         ]
         async with self.session.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{self.config.model}:generateContent?key={self.config.api_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{self.config.model}:generateContent",
+            params={"key": self.config.api_key},
             json={"contents": parts},
             timeout=_request_timeout(),
         ) as response:
@@ -994,7 +1017,7 @@ async def fetch_pollinations_models(
     async with session.get(
         "https://gen.pollinations.ai/text/models",
         headers=headers,
-        timeout=aiohttp.ClientTimeout(total=45),
+        timeout=_model_list_timeout(),
     ) as response:
         response.raise_for_status()
         payload = await response.json()
@@ -1031,7 +1054,7 @@ async def resolve_pollinations_model(
     if _pollinations_models_cache is None:
         return None
     _, _, lookup = _pollinations_models_cache
-    return lookup.get(model_name)
+    return lookup.get(model_name.strip())
 
 
 _NATIVE_TOOL_PROVIDERS = _OPENAI_COMPATIBLE_PROVIDERS | {Provider.POLLINATIONS}
