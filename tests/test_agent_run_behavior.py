@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import aiohttp
+
 from agentcord.agent import CodingAgent
 from agentcord.config import Settings
 from agentcord.database import Database
@@ -131,6 +133,135 @@ class AgentRunBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.summary, "先重新讀取現有程式碼。")
         self.assertEqual(len(provider.generate_messages), 1)
         self.assertIn("不是合法 JSON", provider.generate_messages[0][1]["content"])
+
+
+class _NativeToolProvider:
+    def __init__(self, responses: list[AIResponse]) -> None:
+        self.responses = list(responses)
+        self.tools_seen: list[object] = []
+        self.system_prompts: list[str] = []
+
+    async def stream_generate(self, messages, on_delta=None, **kwargs):
+        del on_delta
+        self.tools_seen.append(kwargs.get("tools"))
+        self.system_prompts.append(str(messages[0]["content"]))
+        return self.responses.pop(0)
+
+
+def _native_response(content: str, tool_calls: list[dict[str, object]] | None = None) -> AIResponse:
+    return AIResponse(
+        content=content,
+        usage=AIUsage(input_tokens=10, output_tokens=10, cost=0.0, model_rate=0.0),
+        model="native-model",
+        tool_calls=tool_calls or [],
+    )
+
+
+class AgentNativeToolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        root = Path(self._tempdir.name)
+        self.settings = Settings(
+            discord_token="",
+            discord_application_id=None,
+            bot_owner_id=None,
+            discord_log_webhook="",
+            data_dir=root / "data",
+            workspace_limit_bytes=4096,
+            default_credits=100,
+            default_pollinations_model="openai",
+            pollinations_api_key="",
+            custom_provider_base_url="",
+            proxy_url="",
+            proxy_username="",
+            proxy_password="",
+            agent_max_iterations=4,
+            agent_max_actions_per_iteration=4,
+            credit_reserve_output_tokens=1024,
+        )
+        self.db = Database(root / "agentcord.db", default_credits=100)
+        self.addCleanup(self.db.close)
+        self.workspace = WorkspaceManager(root / "workspaces", limit_bytes=4096)
+        self.agent = CodingAgent(self.settings, self.db, self.workspace, None)
+
+    async def test_native_tool_calls_drive_actions(self) -> None:
+        provider = _NativeToolProvider(
+            [
+                _native_response(
+                    "",
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "send_message",
+                                "arguments": json.dumps({"message": "原生工具回報"}, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                ),
+                _native_response("整體需求已完成。"),
+            ]
+        )
+
+        with (
+            mock.patch("agentcord.agent.create_provider", return_value=provider),
+            mock.patch(
+                "agentcord.agent.resolve_model_info",
+                new=mock.AsyncMock(
+                    return_value=ProviderModelInfo(name="native-model", context_length=32000, tools=True)
+                ),
+            ),
+        ):
+            result = await self.agent.run(321, "請完成任務")
+
+        self.assertIsNotNone(provider.tools_seen[0])
+        self.assertEqual(result.summary, "整體需求已完成。")
+        tool_messages = [message for message in result.messages if message.role == "tool"]
+        self.assertIn("原生工具回報", tool_messages[0].content)
+
+    async def test_native_unsupported_falls_back_to_simulated(self) -> None:
+        class _FallbackProvider:
+            def __init__(self) -> None:
+                self.native_calls = 0
+                self.simulated_calls = 0
+
+            async def stream_generate(self, messages, on_delta=None, **kwargs):
+                del on_delta, messages
+                if kwargs.get("tools"):
+                    self.native_calls += 1
+                    raise aiohttp.ClientResponseError(
+                        request_info=mock.Mock(),
+                        history=(),
+                        status=400,
+                        message="tools not supported",
+                    )
+                self.simulated_calls += 1
+                return AIResponse(
+                    content=json.dumps(
+                        {"summary": "模擬路徑完成", "done": True, "related_files": [], "actions": []},
+                        ensure_ascii=False,
+                    ),
+                    usage=AIUsage(input_tokens=10, output_tokens=10, cost=0.0, model_rate=0.0),
+                    model="fallback-model",
+                )
+
+        provider = _FallbackProvider()
+        with (
+            mock.patch("agentcord.agent.create_provider", return_value=provider),
+            mock.patch(
+                "agentcord.agent.resolve_model_info",
+                new=mock.AsyncMock(
+                    return_value=ProviderModelInfo(name="fallback-model", context_length=32000, tools=True)
+                ),
+            ),
+        ):
+            result = await self.agent.run(322, "請完成任務")
+
+        self.assertEqual(provider.native_calls, 1)
+        self.assertGreaterEqual(provider.simulated_calls, 1)
+        self.assertEqual(result.summary, "模擬路徑完成")
 
 
 if __name__ == "__main__":

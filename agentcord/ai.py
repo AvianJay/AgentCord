@@ -491,6 +491,7 @@ async def fetch_provider_models(
                 aliases=list(model.aliases),
                 description=model.description,
                 context_length=model.context_length,
+                tools=model.tools,
             )
             for model in await fetch_pollinations_models(session, settings, force_refresh=force_refresh)
         ]
@@ -546,6 +547,7 @@ async def resolve_provider_model(
             aliases=list(model.aliases),
             description=model.description,
             context_length=model.context_length,
+            tools=model.tools,
         )
 
     api_key = api_key.strip()
@@ -620,6 +622,13 @@ class AIProvider(ABC):
         )
 
 
+def _apply_tool_payload(payload: dict[str, Any], kwargs: dict[str, Any]) -> None:
+    tools = kwargs.get("tools")
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = kwargs.get("tool_choice", "auto")
+
+
 class PollinationsProvider(AIProvider):
     async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> AIResponse:
         headers = {"Content-Type": "application/json"}
@@ -630,6 +639,7 @@ class PollinationsProvider(AIProvider):
             "messages": messages,
             "temperature": kwargs.get("temperature", 0.2),
         }
+        _apply_tool_payload(payload, kwargs)
         async with self.session.post(
             "https://gen.pollinations.ai/v1/chat/completions",
             headers=headers,
@@ -638,12 +648,13 @@ class PollinationsProvider(AIProvider):
         ) as response:
             response.raise_for_status()
             data = await response.json()
-        content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
+        content = sanitize_ai_response_content(data["choices"][0]["message"].get("content") or "")
         return AIResponse(
             content=content,
             usage=self._build_usage(messages, content),
             model=_resolve_response_model(data) or self.config.model,
             raw_response=data,
+            tool_calls=_extract_message_tool_calls(data),
         )
 
     async def stream_generate(
@@ -661,6 +672,7 @@ class PollinationsProvider(AIProvider):
             "temperature": kwargs.get("temperature", 0.2),
             "stream": True,
         }
+        _apply_tool_payload(payload, kwargs)
         async with self.session.post(
             "https://gen.pollinations.ai/v1/chat/completions",
             headers=headers,
@@ -670,7 +682,7 @@ class PollinationsProvider(AIProvider):
             response.raise_for_status()
             if response.content_type == "application/json":
                 data = await response.json()
-                content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
+                content = sanitize_ai_response_content(data["choices"][0]["message"].get("content") or "")
                 if on_delta and content:
                     maybe_result = on_delta(content)
                     if maybe_result is not None:
@@ -680,10 +692,12 @@ class PollinationsProvider(AIProvider):
                     usage=self._build_usage(messages, content),
                     model=_resolve_response_model(data) or self.config.model,
                     raw_response=data,
+                    tool_calls=_extract_message_tool_calls(data),
                 )
 
             content_parts: list[str] = []
             response_model = ""
+            tool_call_buffer: dict[int, dict[str, Any]] = {}
             async for raw_line in response.content:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
                 if not line or not line.startswith("data:"):
@@ -696,6 +710,7 @@ class PollinationsProvider(AIProvider):
                 except json.JSONDecodeError:
                     continue
                 response_model = _resolve_response_model(chunk) or response_model
+                _accumulate_stream_tool_calls(chunk, tool_call_buffer)
                 delta = _extract_stream_text(chunk)
                 if not delta:
                     continue
@@ -712,6 +727,7 @@ class PollinationsProvider(AIProvider):
             usage=self._build_usage(messages, content),
             model=resolved_model,
             raw_response={"stream": True, "model": resolved_model},
+            tool_calls=_finalize_stream_tool_calls(tool_call_buffer),
         )
 
 
@@ -746,6 +762,7 @@ class OpenAICompatibleProvider(AIProvider):
             "messages": messages,
             "temperature": kwargs.get("temperature", 0.2),
         }
+        _apply_tool_payload(payload, kwargs)
         async with open_proxy_aware_session(self.session, self.settings, require_proxy=self.require_proxy) as request_session:
             async with request_session.post(
                 f"{self.base_url}/chat/completions",
@@ -756,12 +773,13 @@ class OpenAICompatibleProvider(AIProvider):
             ) as response:
                 response.raise_for_status()
                 data = await response.json()
-        content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
+        content = sanitize_ai_response_content(data["choices"][0]["message"].get("content") or "")
         return AIResponse(
             content=content,
             usage=self._build_usage(messages, content),
             model=_resolve_response_model(data) or self.config.model,
             raw_response=data,
+            tool_calls=_extract_message_tool_calls(data),
         )
 
     async def stream_generate(
@@ -780,6 +798,7 @@ class OpenAICompatibleProvider(AIProvider):
             "temperature": kwargs.get("temperature", 0.2),
             "stream": True,
         }
+        _apply_tool_payload(payload, kwargs)
         async with open_proxy_aware_session(self.session, self.settings, require_proxy=self.require_proxy) as request_session:
             async with request_session.post(
                 f"{self.base_url}/chat/completions",
@@ -791,7 +810,7 @@ class OpenAICompatibleProvider(AIProvider):
                 response.raise_for_status()
                 if response.content_type == "application/json":
                     data = await response.json()
-                    content = sanitize_ai_response_content(data["choices"][0]["message"]["content"])
+                    content = sanitize_ai_response_content(data["choices"][0]["message"].get("content") or "")
                     if on_delta and content:
                         maybe_result = on_delta(content)
                         if maybe_result is not None:
@@ -801,10 +820,12 @@ class OpenAICompatibleProvider(AIProvider):
                         usage=self._build_usage(messages, content),
                         model=_resolve_response_model(data) or self.config.model,
                         raw_response=data,
+                        tool_calls=_extract_message_tool_calls(data),
                     )
 
                 content_parts: list[str] = []
                 response_model = ""
+                tool_call_buffer: dict[int, dict[str, Any]] = {}
                 async for raw_line in response.content:
                     line = raw_line.decode("utf-8", errors="ignore").strip()
                     if not line or not line.startswith("data:"):
@@ -817,6 +838,7 @@ class OpenAICompatibleProvider(AIProvider):
                     except json.JSONDecodeError:
                         continue
                     response_model = _resolve_response_model(chunk) or response_model
+                    _accumulate_stream_tool_calls(chunk, tool_call_buffer)
                     delta = _extract_stream_text(chunk)
                     if not delta:
                         continue
@@ -833,6 +855,7 @@ class OpenAICompatibleProvider(AIProvider):
             usage=self._build_usage(messages, content),
             model=resolved_model,
             raw_response={"stream": True, "model": resolved_model},
+            tool_calls=_finalize_stream_tool_calls(tool_call_buffer),
         )
 
 
@@ -1009,6 +1032,107 @@ async def resolve_pollinations_model(
         return None
     _, _, lookup = _pollinations_models_cache
     return lookup.get(model_name)
+
+
+_NATIVE_TOOL_PROVIDERS = _OPENAI_COMPATIBLE_PROVIDERS | {Provider.POLLINATIONS}
+
+
+def supports_native_tools(provider: Provider, model_info: ProviderModelInfo | None) -> bool:
+    if provider not in _NATIVE_TOOL_PROVIDERS:
+        return False
+    if provider is Provider.POLLINATIONS:
+        return bool(model_info is not None and model_info.tools)
+    # OpenAI-compatible 端點通常支援 function calling；若實際不支援會在請求時 fallback。
+    return True
+
+
+def _normalize_response_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_tool_calls, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw_call in raw_tool_calls:
+        if not isinstance(raw_call, dict):
+            continue
+        function = raw_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        normalized.append(
+            {
+                "id": str(raw_call.get("id") or ""),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": function.get("arguments") or "",
+                },
+            }
+        )
+    return normalized
+
+
+def _extract_message_tool_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return []
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return []
+    message = first_choice.get("message")
+    if isinstance(message, dict):
+        return _normalize_response_tool_calls(message.get("tool_calls"))
+    return []
+
+
+def _accumulate_stream_tool_calls(chunk: dict[str, Any], buffer: dict[int, dict[str, Any]]) -> None:
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return
+    delta = first_choice.get("delta")
+    if not isinstance(delta, dict):
+        return
+    tool_call_deltas = delta.get("tool_calls")
+    if not isinstance(tool_call_deltas, list):
+        return
+    for tool_call_delta in tool_call_deltas:
+        if not isinstance(tool_call_delta, dict):
+            continue
+        index = tool_call_delta.get("index")
+        if not isinstance(index, int):
+            index = len(buffer)
+        entry = buffer.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        call_id = tool_call_delta.get("id")
+        if isinstance(call_id, str) and call_id:
+            entry["id"] = call_id
+        function = tool_call_delta.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str) and name:
+                entry["name"] = name
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                entry["arguments"] += arguments
+
+
+def _finalize_stream_tool_calls(buffer: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    finalized: list[dict[str, Any]] = []
+    for index in sorted(buffer):
+        entry = buffer[index]
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        finalized.append(
+            {
+                "id": str(entry.get("id") or ""),
+                "type": "function",
+                "function": {"name": name, "arguments": entry.get("arguments") or ""},
+            }
+        )
+    return finalized
 
 
 def _extract_stream_text(chunk: dict[str, Any]) -> str:

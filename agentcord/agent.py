@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from agentcord.ai import ModelJSONParseError, PollinationsProvider, create_provider, format_exception_message, parse_json_object, resolve_model_info
+from agentcord.ai import ModelJSONParseError, PollinationsProvider, create_provider, format_exception_message, parse_json_object, resolve_model_info, supports_native_tools
 from agentcord.config import Settings
 from agentcord.database import Database
 from agentcord.models import AIUsage, AgentTaskItem, ConversationMessage, Provider, TaskRecord, TaskStatus, UserModelConfig, estimate_tokens
@@ -142,6 +142,7 @@ class CodingAgent:
         model_info = await resolve_model_info(self.session, self.settings, config)
         context_length = model_info.context_length if model_info is not None else None
         actual_model = model_info.name if model_info is not None else config.model
+        use_native_tools = supports_native_tools(config.provider, model_info)
 
         history_messages = list(task.messages) if task is not None else []
         if not history_messages or history_messages[-1].role != "user" or history_messages[-1].content != prompt:
@@ -219,19 +220,16 @@ class CodingAgent:
                     },
                 )
                 self.credits.ensure_affordable(user_id, config, context)
-                step_response = await provider.stream_generate(
-                    [
-                        {"role": "system", "content": self._build_agent_system_prompt()},
-                        {"role": "user", "content": context},
-                    ],
-                    on_delta=self._build_stream_progress_callback(
-                        f"第 {iteration} 輪決策生成中",
-                        progress_callback,
-                        activity_key=f"decision:{iteration}",
-                    ),
+                decision, decision_model, use_native_tools = await self._generate_decision(
+                    user_id,
+                    provider,
+                    config,
+                    context,
+                    iteration,
+                    use_native_tools,
+                    progress_callback,
                 )
-                self.credits.charge(user_id, config, step_response.usage.cost)
-                actual_model = step_response.model or actual_model
+                actual_model = decision_model or actual_model
                 await self._emit_progress(
                     progress_callback,
                     {
@@ -244,18 +242,6 @@ class CodingAgent:
                         "phase": f"iteration-{iteration}",
                     },
                 )
-                decision, repaired_model = await self._parse_model_json_response(
-                    user_id,
-                    provider,
-                    config,
-                    step_response.content,
-                    schema_hint=_DECISION_JSON_SCHEMA_HINT,
-                    purpose=f"第 {iteration} 輪決策輸出",
-                    progress_callback=progress_callback,
-                    activity_key=f"decision:{iteration}",
-                )
-                if repaired_model:
-                    actual_model = repaired_model
                 await self._remove_activity(progress_callback, activity_key=f"decision:{iteration}")
                 tool_results, touched_files, current_task_items = await self._execute_actions(
                     user_id,
@@ -905,6 +891,115 @@ class CodingAgent:
             ],
         }
 
+    async def _generate_decision(
+        self,
+        user_id: int,
+        provider: Any,
+        config: UserModelConfig,
+        context: str,
+        iteration: int,
+        use_native_tools: bool,
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], str | None, bool]:
+        activity_key = f"decision:{iteration}"
+        if use_native_tools:
+            try:
+                decision, decision_model = await self._generate_native_decision(
+                    user_id,
+                    provider,
+                    config,
+                    context,
+                    iteration,
+                    progress_callback,
+                )
+                return decision, decision_model, True
+            except (aiohttp.ClientResponseError, aiohttp.ClientError) as exc:
+                await self._emit_activity(
+                    progress_callback,
+                    f"原生工具呼叫不可用（{format_exception_message(exc)}），改用模擬工具呼叫。",
+                    activity_key=activity_key,
+                )
+        decision, decision_model = await self._generate_simulated_decision(
+            user_id,
+            provider,
+            config,
+            context,
+            iteration,
+            progress_callback,
+        )
+        return decision, decision_model, False
+
+    async def _generate_native_decision(
+        self,
+        user_id: int,
+        provider: Any,
+        config: UserModelConfig,
+        context: str,
+        iteration: int,
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        activity_key = f"decision:{iteration}"
+        step_response = await provider.stream_generate(
+            [
+                {"role": "system", "content": self._build_agent_system_prompt(native_tools=True)},
+                {"role": "user", "content": context},
+            ],
+            tools=self._build_ai_tools(),
+            tool_choice="auto",
+            on_delta=self._build_stream_progress_callback(
+                f"第 {iteration} 輪決策生成中",
+                progress_callback,
+                activity_key=activity_key,
+            ),
+        )
+        self.credits.charge(user_id, config, step_response.usage.cost)
+        actions = self._normalize_actions(step_response.tool_calls)
+        summary = (step_response.content or "").strip()
+        decision: dict[str, Any] = {
+            "summary": summary or ("呼叫工具中。" if actions else "未進行任何變更。"),
+            "done": not actions,
+            "related_files": [],
+            "actions": actions,
+        }
+        return decision, step_response.model or None
+
+    async def _generate_simulated_decision(
+        self,
+        user_id: int,
+        provider: Any,
+        config: UserModelConfig,
+        context: str,
+        iteration: int,
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        activity_key = f"decision:{iteration}"
+        step_response = await provider.stream_generate(
+            [
+                {"role": "system", "content": self._build_agent_system_prompt(native_tools=False)},
+                {"role": "user", "content": context},
+            ],
+            on_delta=self._build_stream_progress_callback(
+                f"第 {iteration} 輪決策生成中",
+                progress_callback,
+                activity_key=activity_key,
+            ),
+        )
+        self.credits.charge(user_id, config, step_response.usage.cost)
+        actual_model = step_response.model or None
+        decision, repaired_model = await self._parse_model_json_response(
+            user_id,
+            provider,
+            config,
+            step_response.content,
+            schema_hint=_DECISION_JSON_SCHEMA_HINT,
+            purpose=f"第 {iteration} 輪決策輸出",
+            progress_callback=progress_callback,
+            activity_key=activity_key,
+        )
+        if repaired_model:
+            actual_model = repaired_model
+        return decision, actual_model
+
     async def _parse_model_json_response(
         self,
         user_id: int,
@@ -947,7 +1042,18 @@ class CodingAgent:
                     f"原始輸出：{exc.output_preview} | 修正輸出：{repair_exc.output_preview}"
                 ) from repair_exc
 
-    def _build_agent_system_prompt(self) -> str:
+    def _build_agent_system_prompt(self, *, native_tools: bool = False) -> str:
+        if native_tools:
+            return (
+                _AGENT_SYSTEM_PROMPT_PREFIX
+                + "\n工具呼叫方式（原生 function calling）：\n"
+                + "- 需要操作時，直接以原生 tool call 呼叫工具，不要把工具呼叫寫進文字或 JSON。\n"
+                + f"- 一次最多呼叫 {self.settings.agent_max_actions_per_iteration} 個工具。\n"
+                + "- 還需要繼續工作（例如剛做完局部修改、仍要驗證、還有未完成事項）時，請繼續呼叫工具，不要輸出純文字結論。\n"
+                + "- 只有在整體需求已完成、沒有下一步、不需再驗證或詢問使用者時，才不要呼叫任何工具，並用繁體中文輸出最終總結文字。\n"
+                + "- 該段純文字總結會被視為完成訊號（done=true）。\n"
+                + "- 需要主動告知進度或詢問使用者時，請使用 send_message 或 ask_user_choice 工具，而不是直接輸出文字。"
+            )
         tool_schema = json.dumps(self._build_ai_tools(), ensure_ascii=False, indent=2)
         return (
             _AGENT_SYSTEM_PROMPT_PREFIX

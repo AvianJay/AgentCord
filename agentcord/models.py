@@ -66,6 +66,7 @@ class AIResponse:
     usage: AIUsage
     model: str = ""
     raw_response: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -84,6 +85,7 @@ class ProviderModelInfo:
     aliases: list[str] = field(default_factory=list)
     description: str = ""
     context_length: int | None = None
+    tools: bool = False
 
 
 @dataclass(slots=True)
